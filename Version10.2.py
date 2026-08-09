@@ -377,24 +377,36 @@ def refresh_fp16_matrices():
 		fp16_ffn_down_weight_table[layer].copy_(ffn_down_weight_table[layer])
 
 def fp8_matmul(a, b, a_dtype = FP8_E4M3, b_dtype = FP8_E4M3, out_dtype = torch.float16):
+    original_shape = a.shape
+    a_2d = a.reshape(-1, a.shape[-1]) if a.dim() > 2 else a
+    b_2d = b.reshape(-1, b.shape[-1]) if b.dim() > 2 else b
 
     a_max_value = (FP8_E4M3_MAX if a_dtype == FP8_E4M3 else FP8_E5M2_MAX)
-
     b_max_value = (FP8_E4M3_MAX if b_dtype == FP8_E4M3 else FP8_E5M2_MAX)
 
     a_limit = a_max_value * 0.95
     b_limit = b_max_value * 0.95
 
-    a_amax = a.abs().amax().float().clamp_min(1e-12)
-    b_amax = b.abs().amax().float().clamp_min(1e-12)
+    a_amax = a_2d.abs().amax().float().clamp_min(1e-12)
+    b_amax = b_2d.abs().amax().float().clamp_min(1e-12)
 
     a_scale = a_limit / a_amax
     b_scale = b_limit / b_amax
 
-    a_fp8 = (a * a_scale).to(a_dtype)
-    b_fp8 = (b * b_scale).to(b_dtype)
+    a_fp8 = (a_2d * a_scale).to(a_dtype)
+    b_fp8 = (b_2d * b_scale).to(b_dtype)
 
-    return torch._scaled_mm(a_fp8, b_fp8, scale_a = a_scale.reciprocal(), scale_b = b_scale.reciprocal(), out_dtype = out_dtype)
+    result = torch._scaled_mm(
+        a_fp8,
+        b_fp8,
+        scale_a=a_scale.reciprocal(),
+        scale_b=b_scale.reciprocal(),
+        out_dtype=out_dtype,
+    )
+
+    if a.dim() > 2:
+        return result.reshape(*original_shape[:-1], result.shape[-1])
+    return result
 
 def run_forward_attention(layer, input_embeddings, normalized_input_embeddings):
 	#% Shape: 3 x context_length x embedding_size
