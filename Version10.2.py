@@ -15,6 +15,11 @@ mask_value = -2e4
 device = torch.device("cuda")
 torch.manual_seed(12354)
 epsilon = 1e-5
+FP8_E4M3 = torch.float8_e4m3fn
+FP8_E5M2 = torch.float8_e5m2
+
+FP8_E4M3_MAX = torch.finfo(FP8_E4M3).max
+FP8_E5M2_MAX = torch.finfo(FP8_E5M2).max
 
 character_to_id = {
 	"a": 0, "b": 1, "c": 2, "d": 3, "e": 4, "f": 5, "g": 6,
@@ -371,9 +376,29 @@ def refresh_fp16_matrices():
 		fp16_ffn_up_weight_table[layer].copy_(ffn_up_weight_table[layer])
 		fp16_ffn_down_weight_table[layer].copy_(ffn_down_weight_table[layer])
 
+def fp8_matmul(a, b, a_dtype = FP8_E4M3, b_dtype = FP8_E4M3, out_dtype = torch.float16):
+
+    a_max_value = (FP8_E4M3_MAX if a_dtype == FP8_E4M3 else FP8_E5M2_MAX)
+
+    b_max_value = (FP8_E4M3_MAX if b_dtype == FP8_E4M3 else FP8_E5M2_MAX)
+
+    a_limit = a_max_value * 0.95
+    b_limit = b_max_value * 0.95
+
+    a_amax = a.abs().amax().float().clamp_min(1e-12)
+    b_amax = b.abs().amax().float().clamp_min(1e-12)
+
+    a_scale = a_limit / a_amax
+    b_scale = b_limit / b_amax
+
+    a_fp8 = (a * a_scale).to(a_dtype)
+    b_fp8 = (b * b_scale).to(b_dtype)
+
+    return torch._scaled_mm(a_fp8, b_fp8, scale_a = a_scale.reciprocal(), scale_b = b_scale.reciprocal(), out_dtype = out_dtype)
+
 def run_forward_attention(layer, input_embeddings, normalized_input_embeddings):
 	#% Shape: 3 x context_length x embedding_size
-	qkv_matrix = (normalized_input_embeddings @ fp16_qkv_weight_table[layer].transpose(-2, -1))
+	qkv_matrix = fp8_matmul(normalized_input_embeddings, fp16_qkv_weight_table[layer].transpose(-2, -1))
 
 	query_matrix = qkv_matrix[...,0:embedding_size,]
 	key_matrix = qkv_matrix[...,embedding_size:2 * embedding_size,]
@@ -452,11 +477,11 @@ def run_forward_pass(start_positions, source_token_ids):
 		normalized_ffn_input[layer] = (ffn_input * ffn_inverse_root_mean_square[layer]).to(torch.float16)
 		scaled_ffn_input[layer] = normalized_ffn_input[layer] * fp16_ffn_gamma_table[layer]
 
-		ffn_upscale_matrix[layer] = scaled_ffn_input[layer] @ fp16_ffn_up_weight_table[layer]
+		ffn_upscale_matrix[layer] = fp8_matmul(scaled_ffn_input[layer], fp16_ffn_up_weight_table[layer])
 		
 		ffn_upscale_matrix[layer].relu_()
 
-		layer_state[layer + 1] = ffn_upscale_matrix[layer] @ fp16_ffn_down_weight_table[layer] + attention_output_matrix[layer]
+		layer_state[layer + 1] = fp8_matmul(ffn_upscale_matrix[layer], fp16_ffn_down_weight_table[layer]) + attention_output_matrix[layer]
 
 	#% Shape: context_length x number_of_ids
 	#* Dot products attention context vectors with each vocab character's output weights,
@@ -524,7 +549,7 @@ def run_backpropogation_attention(layer, scaled_layer_state, normalized_layer_st
 	#$ dLoss / dCombined_input_value
 	qkv_matrix_gradient = torch.cat([query_matrix_gradient,key_matrix_gradient,value_matrix_gradient,],dim=-1,)
 
-	scaled_layer_state_gradient = (qkv_matrix_gradient @ fp16_qkv_weight_table[layer])
+	scaled_layer_state_gradient = fp8_matmul(qkv_matrix_gradient, fp16_qkv_weight_table[layer], FP8_E5M2, FP8_E4M3)
 	# Do not combine dims into sum(dim=(0,1)):
 	# TorchInductor/ROCm produced incorrect reductions on gfx1031.
 	attention_gamma_gradient = (scaled_layer_state_gradient.float() * normalized_layer_state.float()).sum(dim=0).sum(dim=0)
@@ -540,7 +565,7 @@ def run_backpropogation_attention(layer, scaled_layer_state, normalized_layer_st
 	scaled_layer_state_flat = scaled_layer_state.reshape(-1, embedding_size)
 	qkv_matrix_gradient_flat = qkv_matrix_gradient.reshape(-1, 3 * embedding_size,)
 
-	qkv_weight_table_gradient = qkv_matrix_gradient_flat.transpose(-2, -1) @ scaled_layer_state_flat
+	qkv_weight_table_gradient = fp8_matmul(qkv_matrix_gradient_flat.transpose(-2, -1), scaled_layer_state_flat, FP8_E5M2, FP8_E4M3)
 
 	return [input_embeddings_gradient, qkv_weight_table_gradient, attention_gamma_gradient]
 
@@ -639,13 +664,13 @@ def run_backpropogation(forward_pass_results):
 	for layer in range(number_of_layers-1, -1, -1):
 		#$ dLoss / dFFN_activation_matrix_layer_value
 		#* Upscale_matrix_gradient is the exact same as activation_matrix_gradient, so saving operations here
-		ffn_upscale_matrix_gradient = output_gradient @ fp16_ffn_down_weight_table[layer].transpose(-2, -1)
+		ffn_upscale_matrix_gradient = fp8_matmul(output_gradient, fp16_ffn_down_weight_table[layer].transpose(-2, -1), FP8_E5M2, FP8_E4M3)
 
 		#$ dLoss / dFFN_down_weight_table_layer_value
 		#* ffn_upscale_matrix_layer replaces wherever ffn_activation_matrix should be
 		ffn_activation_matrix_flat = ffn_upscale_matrix[layer].reshape(-1, ffn_hidden_size[layer])
 		output_gradient_flat = output_gradient.reshape(-1, embedding_size)
-		ffn_down_weight_table_gradient[layer] = ffn_activation_matrix_flat.transpose(-2, -1) @ output_gradient_flat
+		ffn_down_weight_table_gradient[layer] = fp8_matmul(ffn_activation_matrix_flat.transpose(-2, -1), output_gradient_flat, FP8_E4M3, FP8_E5M2)
 
 		#$ dLoss / dFFN_upscale_matrix_layer_value
 		ffn_upscale_matrix_gradient.masked_fill_(ffn_upscale_matrix[layer] <= 0, 0.0)
@@ -653,10 +678,10 @@ def run_backpropogation(forward_pass_results):
 		#$ dLoss / dFFN_up_weight_table_layer3_value
 		ffn_upscale_matrix_gradient_flat = ffn_upscale_matrix_gradient.reshape(-1, ffn_hidden_size[layer])
 		scaled_ffn_input_flat = scaled_ffn_input[layer].reshape(-1, embedding_size)
-		ffn_up_weight_table_gradient[layer] = scaled_ffn_input_flat.transpose(-2, -1) @ ffn_upscale_matrix_gradient_flat
+		ffn_up_weight_table_gradient[layer] = fp8_matmul(scaled_ffn_input_flat.transpose(-2, -1), ffn_upscale_matrix_gradient_flat, FP8_E4M3, FP8_E5M2)
 
 		#$ dLoss / dLayer3_attention_output_value
-		scaled_attention_output_gradient = ffn_upscale_matrix_gradient @ fp16_ffn_up_weight_table[layer].transpose(-2, -1)
+		scaled_attention_output_gradient = fp8_matmul(ffn_upscale_matrix_gradient, fp16_ffn_up_weight_table[layer].transpose(-2, -1), FP8_E5M2, FP8_E4M3)
 		# Do not combine dims into sum(dim=(0,1)):
 		# TorchInductor/ROCm produced incorrect reductions on gfx1031.
 		ffn_gamma_gradient[layer] = (scaled_attention_output_gradient.float() * normalized_ffn_input[layer].float()).sum(dim=0).sum(dim=0)
@@ -806,11 +831,11 @@ if (1):
 	ffn_up_scale = 1 / math.sqrt(embedding_size)
 	ffn_down_scale = [1 / math.sqrt(ffn_hidden_size[i]) for i in range(number_of_layers)]
 
-	token_embedding_table = (torch.rand(number_of_ids, embedding_size) * (2 * scale) - scale) * 2
+	token_embedding_table = (torch.rand(number_of_ids, embedding_size) * (2 * scale) - scale) * 16
 
 	#% Shape: context_length x embedding_size
 	#* This gives each possible position in the context window its own learnable vector, so the model can distinguish position 0 from position 1, position 2, etc.
-	positional_embedding_table = (torch.rand(CONTEXT_LENGTH, embedding_size) * (2 * scale) - scale) * 2
+	positional_embedding_table = (torch.rand(CONTEXT_LENGTH, embedding_size) * (2 * scale) - scale) * 16
 
 	#% Shape: 3 x embedding_size x embedding_size
 	qkv_weight_table = torch.rand(number_of_layers, 3 * embedding_size, embedding_size ) * (2 * scale) - scale
