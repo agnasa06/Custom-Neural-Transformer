@@ -1,0 +1,35 @@
+# Python environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local editor and tooling state
+.vscode/
+.idea/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Model weights and training checkpoints
+*.pt
+*.pth
+*.ckpt
+checkpoints/
+Saved_bests/
+Saved_checkpoints/
+
+# Datasets and tokenized training data
+*.parquet
+*.tokens
+*.bin
+*.safetensors
+
+# Generated experiment output and local configuration
+*.log
+V10BenchmarkResults.txt
+learning_scale.txt
+loss_history.csv
+settings.json
