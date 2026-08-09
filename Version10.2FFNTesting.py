@@ -104,6 +104,7 @@ def save_model(path, iteration, best_loss, previous_elapsed_seconds):
 		"ffn_hidden_size": ffn_hidden_size,
 		"persistent_learning_rate": persistent_learning_rate,
 		"head_count": head_count,
+		"norm_power": norm_power,
 
 		"token_embedding_table": token_embedding_table.detach().cpu(),
 		"positional_embedding_table": (
@@ -232,6 +233,9 @@ def load_model(path):
 
 	if "momentum_rate" not in checkpoint:
 		raise ValueError("Cannot load checkpoint: momentum_rate doesn't exist.\n")
+
+	if "norm_power" not in checkpoint:
+		raise ValueError("Cannot load checkpoint: norm_power doesn't exist.\n")
 
 	if "qkv_weight_table_momentum_gradient" not in checkpoint:
 		raise ValueError("Checkpoint does not contain momentum buffers.")
@@ -706,8 +710,8 @@ def run_backpropogation(forward_pass_results):
 	input_token_embeddings_gradient.index_add_(0,flattened_input_token_ids,flattened_embedding_gradient,)
 
 	# + Learning
-
 	scaled_learning_rate = learning_rate_tensor / gradient_scale
+	normalized_learning_rate = learning_rate_tensor / gradient_scale ** (1 - norm_power)
 	attention_gamma_gradient = torch.stack(attention_gamma_gradient, dim=0)
 	ffn_gamma_gradient = torch.stack(ffn_gamma_gradient, dim=0)
 	qkv_weight_table_gradient = torch.stack(qkv_weight_table_gradient,dim=0)
@@ -843,22 +847,29 @@ def run_backpropogation(forward_pass_results):
 
 			"state grad:", residual_gradient_rms[layer],
 		)
-	#& Output
-	
 
+	#& Output
+		
 	output_weight_table -= output_weight_table_momentum_gradient.float() * scaled_learning_rate
 
 	#& FFN tables
 	for layer in range(number_of_layers):
-		ffn_up_weight_table[layer] -= ffn_up_weight_table_momentum_gradient[layer].float()  * scaled_learning_rate
-		ffn_down_weight_table[layer] -= ffn_down_weight_table_momentum_gradient[layer].float()  * scaled_learning_rate
+		ffn_up_weight_table_rms = ffn_up_weight_table[layer].float().square().mean().sqrt()
+		ffn_up_momentum_rms = ffn_up_weight_table_momentum_gradient[layer].float().square().mean().sqrt()
+		ffn_up_weight_table[layer] -= (ffn_up_weight_table_rms / (ffn_up_momentum_rms + epsilon)) ** norm_power * ffn_up_weight_table_momentum_gradient[layer] * normalized_learning_rate
+		
+		ffn_down_weight_table_rms = ffn_down_weight_table[layer].float().square().mean().sqrt()
+		ffn_down_momentum_rms = ffn_down_weight_table_momentum_gradient[layer].float().square().mean().sqrt()
+		ffn_down_weight_table[layer] -= (ffn_down_weight_table_rms / (ffn_down_momentum_rms + epsilon)) ** norm_power * ffn_down_weight_table_momentum_gradient[layer] * normalized_learning_rate
 
 	#& Gamma tables
 	attention_gamma_table -= attention_gamma_table_momentum_gradient.float() * scaled_learning_rate
 	ffn_gamma_table -= ffn_gamma_table_momentum_gradient.float() * scaled_learning_rate
 
 	#& QKV tables
-	qkv_weight_table -= qkv_weight_table_momentum_gradient.float() * scaled_learning_rate
+	qkv_weight_table_rms = qkv_weight_table.float().square().mean(dim=2, keepdim=True).mean(dim=1, keepdim=True).sqrt()
+	qkv_momentum_rms = qkv_weight_table_momentum_gradient.float().square().mean(dim=2, keepdim=True).mean(dim=1, keepdim=True).sqrt()
+	qkv_weight_table -=  (qkv_weight_table_rms / (qkv_momentum_rms + epsilon)) ** norm_power * qkv_weight_table_momentum_gradient * normalized_learning_rate
 
 	#& Token embedding tables
 	positional_embedding_table -= positional_embedding_table_momentum_gradient.float()  * scaled_learning_rate
@@ -903,12 +914,13 @@ compiled_training_step = torch.compile(
 
 
 #! Settings                                                 
-embedding_size = 512
+embedding_size = 768
 CONTEXT_LENGTH = 128
 batch_size = 8
 gradient_scale = 256
-head_count = 4
+head_count = 6
 momentum_rate = 0.9
+norm_power = 0.5
 number_of_training_windows = len(token_ids) - CONTEXT_LENGTH
 load_persistent_learning = True
 ffn_hidden_multiplier = [4, 3, 3, 3, 3, 3, 3, 3]
@@ -1006,7 +1018,7 @@ number_of_validation_batches = 32
 fixed_validation_positions = torch.randint(high = len(validation_token_ids) - CONTEXT_LENGTH, size = (number_of_validation_batches, batch_size, 1), dtype = torch.long)
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
-checkpoint_path = CHECKPOINT_DIR / f"{CONTEXT_LENGTH}x{embedding_size}_{number_of_layers}lr_atNorm_{head_count}hd_mon.pt"
+checkpoint_path = CHECKPOINT_DIR / f"{CONTEXT_LENGTH}x{embedding_size}_{number_of_layers}lr_atNorm_{head_count}hd_mon_rms.pt"
 
 if checkpoint_path.exists() and checkpoint_path.stat().st_size > 0:
 	iteration, current_least_loss, persistent_learning_rate, previous_elapsed_seconds = load_model(checkpoint_path)
@@ -1094,7 +1106,7 @@ while True:
 			last_improvement_window = 0
 
 			save_model(
-				CHECKPOINT_DIR / f"{CONTEXT_LENGTH}x{embedding_size}_{number_of_layers}lr_atNorm_{head_count}hd_mon.pt",
+				CHECKPOINT_DIR / f"{CONTEXT_LENGTH}x{embedding_size}_{number_of_layers}lr_atNorm_{head_count}hd_mon_rms.pt",
 				iteration=iteration,
 				best_loss=current_least_loss,
 				previous_elapsed_seconds=previous_elapsed_seconds + current_elapsed_seconds,
