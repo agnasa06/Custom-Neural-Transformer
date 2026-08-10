@@ -1,14 +1,58 @@
 #V10.2: Changed learning to momentum gradient learning
 
+import subprocess
+import sys
+
 import torch
 import torch.nn.functional as F
 import pandas as pd
 import math
 import os
+import shutil
 import time
 from pathlib import Path
 import numpy as np
 
+
+def ensure_single_gpu_job():
+	"""Fail fast if another GPU compute process is already active."""
+	nvidia_smi = shutil.which("nvidia-smi") or "/usr/lib/wsl/lib/nvidia-smi"
+	if not Path(nvidia_smi).is_file():
+		raise RuntimeError(
+			"nvidia-smi not found; add it to PATH or install the NVIDIA WSL utilities."
+		)
+
+	try:
+		result = subprocess.run(
+			[
+				nvidia_smi,
+				"--query-compute-apps=pid,process_name,used_memory",
+				"--format=csv,noheader",
+			],
+			capture_output=True,
+			text=True,
+			check=False,
+		)
+	except FileNotFoundError as exc:
+		raise RuntimeError("nvidia-smi not found; cannot enforce single-GPU training.") from exc
+
+	if result.returncode != 0:
+		raise RuntimeError(
+			"nvidia-smi failed while checking for active GPU jobs. "
+			f"stderr: {result.stderr.strip() or '<empty>'}"
+		)
+
+	active_jobs = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+	if active_jobs:
+		print("GPU is already in use by another process. Exiting before training starts.")
+		for job in active_jobs:
+			print(f"  - {job}")
+		raise SystemExit(1)
+
+	print("No active GPU compute jobs detected by nvidia-smi; starting training.")
+
+
+ensure_single_gpu_job()
 
 UNKNOWN_TOKEN = "<unk>"
 mask_value = -2e4
@@ -846,7 +890,7 @@ compiled_training_step = torch.compile(
 #! Settings                                                 
 embedding_size = 768
 CONTEXT_LENGTH = 128
-batch_size = 8
+batch_size = 32
 gradient_scale = 256
 head_count = 6
 momentum_rate = 0.9
