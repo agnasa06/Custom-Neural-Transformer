@@ -421,61 +421,61 @@ def refresh_fp16_matrices():
 		fp16_ffn_down_weight_table[layer].copy_(ffn_down_weight_table[layer])
 
 def fp8_matmul(
-    a,
-    b,
-    a_dtype=FP8_E4M3,
-    b_dtype=FP8_E4M3,
-    out_dtype=torch.float16,
+	a,
+	b,
+	a_dtype=FP8_E4M3,
+	b_dtype=FP8_E4M3,
+	out_dtype=torch.bfloat16,
 ):
-    original_shape = a.shape
+	original_shape = a.shape
 
-    a_2d = (
-        a.reshape(-1, a.shape[-1])
-        if a.dim() > 2
-        else a
-    )
+	a_2d = (
+		a.reshape(-1, a.shape[-1])
+		if a.dim() > 2
+		else a
+	)
 
-    b_2d = (
-        b.reshape(-1, b.shape[-1])
-        if b.dim() > 2
-        else b
-    )
+	b_2d = (
+		b.reshape(-1, b.shape[-1])
+		if b.dim() > 2
+		else b
+	)
 
-    # cuBLASLt FP8 wants A row-major and B column-major.
-    a_2d = a_2d.contiguous()
+	# cuBLASLt FP8 wants A row-major and B column-major.
+	a_2d = a_2d.contiguous()
 
-    # Make B column-major while preserving its mathematical shape.
-    b_2d = b_2d.T.contiguous().T
+	# Make B column-major while preserving its mathematical shape.
+	b_2d = b_2d.T.contiguous().T
 
-    a_max_value = (
-        FP8_E4M3_MAX
-        if a_dtype == FP8_E4M3
-        else FP8_E5M2_MAX
-    )
+	a_max_value = (
+		FP8_E4M3_MAX
+		if a_dtype == FP8_E4M3
+		else FP8_E5M2_MAX
+	)
 
-    b_max_value = (
-        FP8_E4M3_MAX
-        if b_dtype == FP8_E4M3
-        else FP8_E5M2_MAX
-    )
+	b_max_value = (
+		FP8_E4M3_MAX
+		if b_dtype == FP8_E4M3
+		else FP8_E5M2_MAX
+	)
 
-    a_amax = a_2d.abs().amax().float().clamp_min(1e-12)
-    b_amax = b_2d.abs().amax().float().clamp_min(1e-12)
+	a_amax = a_2d.abs().amax().float().clamp_min(1e-12)
+	b_amax = b_2d.abs().amax().float().clamp_min(1e-12)
 
-    a_scale = (a_max_value * 0.5) / a_amax
-    b_scale = (b_max_value * 0.5) / b_amax
+	a_scale = (a_max_value * 0.5) / a_amax
+	b_scale = (b_max_value * 0.5) / b_amax
 
-    a_fp8 = (a_2d * a_scale).to(a_dtype)
-    b_fp8 = (b_2d * b_scale).to(b_dtype)
+	a_fp8 = (a_2d * a_scale).to(a_dtype)
+	b_fp8 = (b_2d * b_scale).to(b_dtype)
 
-    result = torch._scaled_mm(
-        a_fp8,
-        b_fp8,
-        scale_a=a_scale.reciprocal(),
-        scale_b=b_scale.reciprocal(),
-        out_dtype=out_dtype,
-    )
-	if not torch.isfinite(result).all():
+	result = torch._scaled_mm(
+		a_fp8,
+		b_fp8,
+		scale_a=a_scale.reciprocal(),
+		scale_b=b_scale.reciprocal(),
+		out_dtype=out_dtype,
+	)
+	""" if not torch.isfinite(result).all():
 		print("FP8 GEMM NONFINITE")
 		print("A dtype:", a_dtype)
 		print("B dtype:", b_dtype)
@@ -487,14 +487,14 @@ def fp8_matmul(
 		print("B scale:", b_scale.item())
 		print("result max:", result.abs().amax().item())
 		raise RuntimeError("FP8 GEMM produced NaN/Inf")
+ """
+	if a.dim() > 2:
+		result = result.reshape(
+			*original_shape[:-1],
+			result.shape[-1],
+		)
 
-    if a.dim() > 2:
-        result = result.reshape(
-            *original_shape[:-1],
-            result.shape[-1],
-        )
-
-    return result
+	return result
 
 def run_forward_attention(layer, input_embeddings, normalized_input_embeddings):
 	#% Shape: 3 x context_length x embedding_size
@@ -511,7 +511,7 @@ def run_forward_attention(layer, input_embeddings, normalized_input_embeddings):
 	#% Shape: context_length x context_length
 	attention_score_matrix = query_matrix @ key_matrix.transpose(-2, -1) / math.sqrt(embedding_size // head_count)
 	attention_score_matrix = attention_score_matrix.masked_fill(future_mask, mask_value)
-	attention_weight_matrix = torch.softmax(attention_score_matrix.float(), dim=-1).to(torch.float16)
+	attention_weight_matrix = torch.softmax(attention_score_matrix.float(), dim=-1).to(torch.bfloat16)
 
 	#% Shape: context_length x embedding_size
 	attention_output_matrix = (attention_weight_matrix @ value_matrix).transpose(1, 2)
@@ -566,7 +566,7 @@ def run_forward_pass(start_positions, source_token_ids):
 		layer_state_input = layer_state[layer].float()
 		root_mean_square = torch.sqrt(layer_state_input.square().mean(dim = -1, keepdim = True) + epsilon)
 		attention_inverse_root_mean_square[layer] = 1 / root_mean_square
-		normalized_layer_state[layer] = (layer_state_input * attention_inverse_root_mean_square[layer]).to(torch.float16)
+		normalized_layer_state[layer] = (layer_state_input * attention_inverse_root_mean_square[layer]).to(torch.bfloat16)
 		scaled_layer_state[layer] = normalized_layer_state[layer] * fp16_attention_gamma_table[layer]
 		(query_matrix[layer], key_matrix[layer], value_matrix[layer], 
 		attention_weight_matrix[layer], attention_output_matrix[layer]) = run_forward_attention(layer, layer_state[layer], scaled_layer_state[layer])
@@ -574,7 +574,7 @@ def run_forward_pass(start_positions, source_token_ids):
 		ffn_input = attention_output_matrix[layer].float()
 		root_mean_square = torch.sqrt(ffn_input.square().mean(dim = -1, keepdim = True) + epsilon)
 		ffn_inverse_root_mean_square[layer] = 1 / root_mean_square
-		normalized_ffn_input[layer] = (ffn_input * ffn_inverse_root_mean_square[layer]).to(torch.float16)
+		normalized_ffn_input[layer] = (ffn_input * ffn_inverse_root_mean_square[layer]).to(torch.bfloat16)
 		scaled_ffn_input[layer] = normalized_ffn_input[layer] * fp16_ffn_gamma_table[layer]
 
 		ffn_upscale_matrix[layer] = fp8_matmul(scaled_ffn_input[layer], fp16_ffn_up_weight_table[layer])
@@ -592,7 +592,7 @@ def run_forward_pass(start_positions, source_token_ids):
 	#* Softmaxes logits_matrix row by row, so each position gets softmaxed where the character ids are turned into probabilities
 	log_probability_matrix = F.log_softmax(logits_matrix.float(),dim=-1,)
 
-	probability_matrix = (log_probability_matrix.exp().to(torch.float16))
+	probability_matrix = (log_probability_matrix.exp().to(torch.bfloat16))
 
 	average_loss = -log_probability_matrix[batch_indices,context_indices,target_token_ids,].mean()
 
@@ -650,14 +650,12 @@ def run_backpropogation_attention(layer, scaled_layer_state, normalized_layer_st
 	qkv_matrix_gradient = torch.cat([query_matrix_gradient,key_matrix_gradient,value_matrix_gradient,],dim=-1,)
 
 	scaled_layer_state_gradient = fp8_matmul(qkv_matrix_gradient, fp16_qkv_weight_table[layer], FP8_E4M3, FP8_E4M3)
-	# Do not combine dims into sum(dim=(0,1)):
-	# TorchInductor/ROCm produced incorrect reductions on gfx1031.
-	attention_gamma_gradient = (scaled_layer_state_gradient.float() * normalized_layer_state.float()).sum(dim=0).sum(dim=0)
+	attention_gamma_gradient = (scaled_layer_state_gradient.float() * normalized_layer_state.float()).sum(dim=(0,1))
 
 	normalized_layer_state_gradient = (scaled_layer_state_gradient * fp16_attention_gamma_table[layer])
 	shared_scale_gradient = (normalized_layer_state_gradient.float() * normalized_layer_state.float()).mean(dim=-1, keepdim=True)
 
-	input_embeddings_gradient = (inverse_root_mean_square * (normalized_layer_state_gradient - normalized_layer_state * shared_scale_gradient)).to(torch.float16)
+	input_embeddings_gradient = (inverse_root_mean_square * (normalized_layer_state_gradient - normalized_layer_state * shared_scale_gradient)).to(torch.bfloat16)
 	attention_output_gradient = attention_output_gradient.transpose(1, 2).reshape(batch_size, CONTEXT_LENGTH, embedding_size)
 	input_embeddings_gradient += attention_output_gradient
 	
@@ -782,14 +780,12 @@ def run_backpropogation(forward_pass_results):
 
 		#$ dLoss / dLayer3_attention_output_value
 		scaled_attention_output_gradient = fp8_matmul(ffn_upscale_matrix_gradient, fp16_ffn_up_weight_table[layer].transpose(-2, -1), FP8_E4M3, FP8_E4M3)
-		# Do not combine dims into sum(dim=(0,1)):
-		# TorchInductor/ROCm produced incorrect reductions on gfx1031.
-		ffn_gamma_gradient[layer] = (scaled_attention_output_gradient.float() * normalized_ffn_input[layer].float()).sum(dim=0).sum(dim=0)
+		ffn_gamma_gradient[layer] = (scaled_attention_output_gradient.float() * normalized_ffn_input[layer].float()).sum(dim=(0,1))
 
 		normalized_attention_output_gradient = (scaled_attention_output_gradient * fp16_ffn_gamma_table[layer])
 		shared_scale_gradient = (normalized_attention_output_gradient.float() * normalized_ffn_input[layer].float()).mean(dim=-1, keepdim=True)
 
-		attention_output_gradient = (ffn_inverse_root_mean_square[layer] * (normalized_attention_output_gradient - normalized_ffn_input[layer] * shared_scale_gradient)).to(torch.float16)
+		attention_output_gradient = (ffn_inverse_root_mean_square[layer] * (normalized_attention_output_gradient - normalized_ffn_input[layer] * shared_scale_gradient)).to(torch.bfloat16)
 		attention_output_gradient.add_(output_gradient)
 
 		(output_gradient, qkv_weight_table_gradient[layer], attention_gamma_gradient[layer]) = run_backpropogation_attention(layer, scaled_layer_state[layer],normalized_layer_state[layer], query_matrix[layer], key_matrix[layer], 
@@ -815,7 +811,7 @@ def run_backpropogation(forward_pass_results):
 
 	input_token_embeddings_gradient.index_add_(0,flattened_input_token_ids,flattened_embedding_gradient,)
 
-	# + Learning
+	#+ Learning
 	scaled_learning_rate = learning_rate_tensor / gradient_scale
 	normalized_learning_rate = learning_rate_tensor / gradient_scale ** (1 - norm_power)
 	attention_gamma_gradient = torch.stack(attention_gamma_gradient, dim=0)
@@ -894,6 +890,7 @@ def set_learning_rate(loss):
 
 compiled_training_step = torch.compile(
 	training_step,
+	# max-autotune-no-cudagraphs for long uses. default mode for testing
 	mode="default",
 	dynamic=False,
 )
@@ -984,14 +981,14 @@ if (1):
 	context_indices_plus1 = torch.arange(CONTEXT_LENGTH + 1, dtype=torch.long)[None, :]
 	learning_rate_tensor = torch.tensor(learning_rate, device=device, dtype=torch.float32)
 
-	fp16_token_embedding_table = token_embedding_table.to(torch.float16)
-	fp16_positional_embedding_table = positional_embedding_table.to(torch.float16)
-	fp16_qkv_weight_table = qkv_weight_table.to(torch.float16)
-	fp16_output_weight_table = output_weight_table.to(torch.float16)
-	fp16_ffn_up_weight_table = [ffn_up_weight_table[i].to(torch.float16) for i in range(number_of_layers)]
-	fp16_ffn_down_weight_table = [ffn_down_weight_table[i].to(torch.float16) for i in range(number_of_layers)]
-	fp16_attention_gamma_table = attention_gamma_table.to(torch.float16)
-	fp16_ffn_gamma_table = ffn_gamma_table.to(torch.float16)
+	fp16_token_embedding_table = token_embedding_table.to(torch.bfloat16)
+	fp16_positional_embedding_table = positional_embedding_table.to(torch.bfloat16)
+	fp16_qkv_weight_table = qkv_weight_table.to(torch.bfloat16)
+	fp16_output_weight_table = output_weight_table.to(torch.bfloat16)
+	fp16_ffn_up_weight_table = [ffn_up_weight_table[i].to(torch.bfloat16) for i in range(number_of_layers)]
+	fp16_ffn_down_weight_table = [ffn_down_weight_table[i].to(torch.bfloat16) for i in range(number_of_layers)]
+	fp16_attention_gamma_table = attention_gamma_table.to(torch.bfloat16)
+	fp16_ffn_gamma_table = ffn_gamma_table.to(torch.bfloat16)
 
 iteration = 0
 loss_window_average = 0.0
@@ -1039,7 +1036,7 @@ while True:
 	iteration += 1
 
 	start_positions = torch.randint(high = number_of_training_windows, size = (batch_size,), dtype = torch.long)[:, None]
-	window_loss = training_step(start_positions, token_ids)
+	window_loss = compiled_training_step(start_positions, token_ids)
 
 	# print(iteration, window_loss.item())
 
