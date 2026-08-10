@@ -462,8 +462,8 @@ def fp8_matmul(
     a_amax = a_2d.abs().amax().float().clamp_min(1e-12)
     b_amax = b_2d.abs().amax().float().clamp_min(1e-12)
 
-    a_scale = (a_max_value * 0.95) / a_amax
-    b_scale = (b_max_value * 0.95) / b_amax
+    a_scale = (a_max_value * 0.5) / a_amax
+    b_scale = (b_max_value * 0.5) / b_amax
 
     a_fp8 = (a_2d * a_scale).to(a_dtype)
     b_fp8 = (b_2d * b_scale).to(b_dtype)
@@ -475,6 +475,18 @@ def fp8_matmul(
         scale_b=b_scale.reciprocal(),
         out_dtype=out_dtype,
     )
+	if not torch.isfinite(result).all():
+		print("FP8 GEMM NONFINITE")
+		print("A dtype:", a_dtype)
+		print("B dtype:", b_dtype)
+		print("A shape:", a_2d.shape)
+		print("B shape:", b_2d.shape)
+		print("A max:", a_2d.abs().amax().item())
+		print("B max:", b_2d.abs().amax().item())
+		print("A scale:", a_scale.item())
+		print("B scale:", b_scale.item())
+		print("result max:", result.abs().amax().item())
+		raise RuntimeError("FP8 GEMM produced NaN/Inf")
 
     if a.dim() > 2:
         result = result.reshape(
@@ -637,7 +649,7 @@ def run_backpropogation_attention(layer, scaled_layer_state, normalized_layer_st
 	#$ dLoss / dCombined_input_value
 	qkv_matrix_gradient = torch.cat([query_matrix_gradient,key_matrix_gradient,value_matrix_gradient,],dim=-1,)
 
-	scaled_layer_state_gradient = fp8_matmul(qkv_matrix_gradient, fp16_qkv_weight_table[layer], FP8_E5M2, FP8_E4M3)
+	scaled_layer_state_gradient = fp8_matmul(qkv_matrix_gradient, fp16_qkv_weight_table[layer], FP8_E4M3, FP8_E4M3)
 	# Do not combine dims into sum(dim=(0,1)):
 	# TorchInductor/ROCm produced incorrect reductions on gfx1031.
 	attention_gamma_gradient = (scaled_layer_state_gradient.float() * normalized_layer_state.float()).sum(dim=0).sum(dim=0)
@@ -653,7 +665,7 @@ def run_backpropogation_attention(layer, scaled_layer_state, normalized_layer_st
 	scaled_layer_state_flat = scaled_layer_state.reshape(-1, embedding_size)
 	qkv_matrix_gradient_flat = qkv_matrix_gradient.reshape(-1, 3 * embedding_size,)
 
-	qkv_weight_table_gradient = fp8_matmul(qkv_matrix_gradient_flat.transpose(-2, -1), scaled_layer_state_flat, FP8_E5M2, FP8_E4M3)
+	qkv_weight_table_gradient = fp8_matmul(qkv_matrix_gradient_flat.transpose(-2, -1), scaled_layer_state_flat, FP8_E4M3, FP8_E4M3)
 
 	return [input_embeddings_gradient, qkv_weight_table_gradient, attention_gamma_gradient]
 
@@ -752,13 +764,13 @@ def run_backpropogation(forward_pass_results):
 	for layer in range(number_of_layers-1, -1, -1):
 		#$ dLoss / dFFN_activation_matrix_layer_value
 		#* Upscale_matrix_gradient is the exact same as activation_matrix_gradient, so saving operations here
-		ffn_upscale_matrix_gradient = fp8_matmul(output_gradient, fp16_ffn_down_weight_table[layer].transpose(-2, -1), FP8_E5M2, FP8_E4M3)
+		ffn_upscale_matrix_gradient = fp8_matmul(output_gradient, fp16_ffn_down_weight_table[layer].transpose(-2, -1), FP8_E4M3, FP8_E4M3)
 
 		#$ dLoss / dFFN_down_weight_table_layer_value
 		#* ffn_upscale_matrix_layer replaces wherever ffn_activation_matrix should be
 		ffn_activation_matrix_flat = ffn_upscale_matrix[layer].reshape(-1, ffn_hidden_size[layer])
 		output_gradient_flat = output_gradient.reshape(-1, embedding_size)
-		ffn_down_weight_table_gradient[layer] = fp8_matmul(ffn_activation_matrix_flat.transpose(-2, -1), output_gradient_flat, FP8_E4M3, FP8_E5M2)
+		ffn_down_weight_table_gradient[layer] = fp8_matmul(ffn_activation_matrix_flat.transpose(-2, -1), output_gradient_flat, FP8_E4M3, FP8_E4M3)
 
 		#$ dLoss / dFFN_upscale_matrix_layer_value
 		ffn_upscale_matrix_gradient.masked_fill_(ffn_upscale_matrix[layer] <= 0, 0.0)
@@ -766,10 +778,10 @@ def run_backpropogation(forward_pass_results):
 		#$ dLoss / dFFN_up_weight_table_layer3_value
 		ffn_upscale_matrix_gradient_flat = ffn_upscale_matrix_gradient.reshape(-1, ffn_hidden_size[layer])
 		scaled_ffn_input_flat = scaled_ffn_input[layer].reshape(-1, embedding_size)
-		ffn_up_weight_table_gradient[layer] = fp8_matmul(scaled_ffn_input_flat.transpose(-2, -1), ffn_upscale_matrix_gradient_flat, FP8_E4M3, FP8_E5M2)
+		ffn_up_weight_table_gradient[layer] = fp8_matmul(scaled_ffn_input_flat.transpose(-2, -1), ffn_upscale_matrix_gradient_flat, FP8_E4M3, FP8_E4M3)
 
 		#$ dLoss / dLayer3_attention_output_value
-		scaled_attention_output_gradient = fp8_matmul(ffn_upscale_matrix_gradient, fp16_ffn_up_weight_table[layer].transpose(-2, -1), FP8_E5M2, FP8_E4M3)
+		scaled_attention_output_gradient = fp8_matmul(ffn_upscale_matrix_gradient, fp16_ffn_up_weight_table[layer].transpose(-2, -1), FP8_E4M3, FP8_E4M3)
 		# Do not combine dims into sum(dim=(0,1)):
 		# TorchInductor/ROCm produced incorrect reductions on gfx1031.
 		ffn_gamma_gradient[layer] = (scaled_attention_output_gradient.float() * normalized_ffn_input[layer].float()).sum(dim=0).sum(dim=0)
@@ -1027,7 +1039,7 @@ while True:
 	iteration += 1
 
 	start_positions = torch.randint(high = number_of_training_windows, size = (batch_size,), dtype = torch.long)[:, None]
-	window_loss = compiled_training_step(start_positions, token_ids)
+	window_loss = training_step(start_positions, token_ids)
 
 	# print(iteration, window_loss.item())
 
