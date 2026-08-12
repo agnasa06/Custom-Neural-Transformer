@@ -4,6 +4,7 @@
 
 import subprocess
 import sys
+from torch.profiler import profile, ProfilerActivity
 
 import torch
 import torch.nn.functional as F
@@ -19,6 +20,8 @@ from torchao.float8 import (
 	Float8LinearConfig,
 	convert_to_float8_training,
 )
+from torchao.float8.float8_scaling_utils import hp_tensor_to_float8_dynamic
+from torchao.float8.float8_training_tensor import LinearMMConfig
 from dataclasses import replace
 from torchao.float8 import Float8GemmConfig
 
@@ -64,6 +67,7 @@ def ensure_single_gpu_job():
 ensure_single_gpu_job()
 
 torch.set_float32_matmul_precision('high')
+torch._inductor.config.triton.cudagraph_support_input_mutation = True
 
 UNKNOWN_TOKEN = "<unk>"
 mask_value = -2e4
@@ -402,13 +406,10 @@ def run_forward_attention(layer, input_embeddings, normalized_input_embeddings):
 	key_matrix = key_matrix.reshape(batch_size, CONTEXT_LENGTH, head_count, embedding_size // head_count).transpose(1, 2)
 	value_matrix = value_matrix.reshape(batch_size, CONTEXT_LENGTH, head_count, embedding_size // head_count).transpose(1, 2)
 	
-	#% Shape: context_length x context_length
-	attention_score_matrix = query_matrix @ key_matrix.transpose(-2, -1) / math.sqrt(embedding_size // head_count)
-	attention_score_matrix = attention_score_matrix.masked_fill(future_mask, mask_value)
-	attention_weight_matrix = torch.softmax(attention_score_matrix, dim=-1)
-
-	#% Shape: context_length x embedding_size
-	attention_output_matrix = (attention_weight_matrix @ value_matrix).transpose(1, 2)
+	attention_output_matrix = F.scaled_dot_product_attention(
+		query_matrix, key_matrix, value_matrix,
+		dropout_p=0, is_causal=True
+	).transpose(1, 2)
 	attention_output_matrix = attention_output_matrix.reshape(batch_size, CONTEXT_LENGTH, embedding_size)
 	attention_output_matrix = attention_output_matrix + input_embeddings
 
@@ -460,69 +461,76 @@ def run_forward_pass(start_positions, source_token_ids):
 
 	
 
-	#% Shape: context_length x number_of_ids
-	#* Dot products attention context vectors with each vocab character's output weights,
-	#* so if logits_matrix[10][20] is high, it means the attenuated output vector at position 10 supports the usage of character_id 20, so 'u' in this case
 	logits_matrix = layer_state @ output_weight_table.transpose(-2, -1)
 
-	#% Shape: context_length x number_of_ids
-	#* Softmaxes logits_matrix row by row, so each position gets softmaxed where the character ids are turned into probabilities
-	log_probability_matrix = F.log_softmax(logits_matrix,dim=-1,)
-
-	average_loss = -log_probability_matrix[batch_indices,context_indices,target_token_ids,].mean()
+	average_loss = F.cross_entropy(
+		logits_matrix.reshape(-1, number_of_ids),
+		target_token_ids.reshape(-1),
+	)
 
 	return average_loss
 
 def update_weights():
 	with torch.no_grad():
 		normalized_learning_rate = learning_rate_tensor #** (1 - norm_power)
+
+		#& Token and positional embedding tables
 		token_embedding_table_momentum_gradient.mul_(momentum_rate)
 		token_embedding_table_momentum_gradient.add_(token_embedding_table.grad, alpha=(1 - momentum_rate))
+		token_embedding_table.sub_(token_embedding_table_momentum_gradient * normalized_learning_rate)
+
 		positional_embedding_table_momentum_gradient.mul_(momentum_rate)
 		positional_embedding_table_momentum_gradient.add_(positional_embedding_table.grad, alpha=(1 - momentum_rate))
+		positional_embedding_table.sub_(positional_embedding_table_momentum_gradient * normalized_learning_rate)
+
+		#& QKV layers
 		for layer in range(number_of_layers):
 			qkv_linear_momentum_gradient[layer].mul_(momentum_rate)
 			qkv_linear_momentum_gradient[layer].add_(qkv_linear[layer].weight.grad, alpha=(1 - momentum_rate))
-			
+
+			qkv_weight_rms = qkv_linear[layer].weight.square().mean().sqrt()
+			qkv_momentum_rms = qkv_linear_momentum_gradient[layer].square().mean().sqrt()
+			qkv_linear[layer].weight.sub_(
+				(qkv_weight_rms / (qkv_momentum_rms + epsilon)) ** norm_power
+				* qkv_linear_momentum_gradient[layer]
+				* normalized_learning_rate
+			)
+
+		#& Output table
 		output_weight_table_momentum_gradient.mul_(momentum_rate)
 		output_weight_table_momentum_gradient.add_(output_weight_table.grad, alpha=(1 - momentum_rate))
+		output_weight_table.sub_(output_weight_table_momentum_gradient * normalized_learning_rate)
+
+		#& FFN layers
 		for layer in range(number_of_layers):
 			ffn_up_linear_momentum_gradient[layer].mul_(momentum_rate)
 			ffn_up_linear_momentum_gradient[layer].add_(ffn_up_linear[layer].weight.grad, alpha=(1 - momentum_rate))
-			ffn_down_linear_momentum_gradient[layer].mul_(momentum_rate)
-			ffn_down_linear_momentum_gradient[layer].add_(ffn_down_linear[layer].weight.grad, alpha=(1 - momentum_rate))
-		attention_gamma_table_momentum_gradient.mul_(momentum_rate)
-		attention_gamma_table_momentum_gradient.add_(attention_gamma_table.grad, alpha=(1 - momentum_rate))
-		ffn_gamma_table_momentum_gradient.mul_(momentum_rate)
-		ffn_gamma_table_momentum_gradient.add_(ffn_gamma_table.grad, alpha=(1 - momentum_rate))
-		#& Output
-		
-	
-		output_weight_table.sub_(output_weight_table_momentum_gradient * learning_rate_tensor)
-	
-		#& FFN tables
-		for layer in range(number_of_layers):
 			ffn_up_linear_rms = ffn_up_linear[layer].weight.square().mean().sqrt()
 			ffn_up_momentum_rms = ffn_up_linear_momentum_gradient[layer].square().mean().sqrt()
-			ffn_up_linear[layer].weight.sub_((ffn_up_linear_rms / (ffn_up_momentum_rms + epsilon)) ** norm_power * ffn_up_linear_momentum_gradient[layer] * normalized_learning_rate)
-			
+			ffn_up_linear[layer].weight.sub_(
+				(ffn_up_linear_rms / (ffn_up_momentum_rms + epsilon)) ** norm_power
+				* ffn_up_linear_momentum_gradient[layer]
+				* normalized_learning_rate
+			)
+
+			ffn_down_linear_momentum_gradient[layer].mul_(momentum_rate)
+			ffn_down_linear_momentum_gradient[layer].add_(ffn_down_linear[layer].weight.grad, alpha=(1 - momentum_rate))
 			ffn_down_linear_rms = ffn_down_linear[layer].weight.square().mean().sqrt()
 			ffn_down_momentum_rms = ffn_down_linear_momentum_gradient[layer].square().mean().sqrt()
-			ffn_down_linear[layer].weight.sub_((ffn_down_linear_rms / (ffn_down_momentum_rms + epsilon)) ** norm_power * ffn_down_linear_momentum_gradient[layer] * normalized_learning_rate)
-	
+			ffn_down_linear[layer].weight.sub_(
+				(ffn_down_linear_rms / (ffn_down_momentum_rms + epsilon)) ** norm_power
+				* ffn_down_linear_momentum_gradient[layer]
+				* normalized_learning_rate
+			)
+
 		#& Gamma tables
-		attention_gamma_table.sub_(attention_gamma_table_momentum_gradient * learning_rate_tensor)
-		ffn_gamma_table.sub_(ffn_gamma_table_momentum_gradient * learning_rate_tensor)
-	
-		#& QKV tables
-		for layer in range(number_of_layers):
-			qkv_weight_rms = qkv_linear[layer].weight.square().mean().sqrt()
-			qkv_momentum_rms = qkv_linear_momentum_gradient[layer].square().mean().sqrt()
-			qkv_linear[layer].weight.sub_((qkv_weight_rms / (qkv_momentum_rms + epsilon)) ** norm_power * qkv_linear_momentum_gradient[layer] * normalized_learning_rate)
-	
-		#& Token embedding tables
-		positional_embedding_table.sub_(positional_embedding_table_momentum_gradient * learning_rate_tensor)
-		token_embedding_table.sub_(token_embedding_table_momentum_gradient * learning_rate_tensor)
+		attention_gamma_table_momentum_gradient.mul_(momentum_rate)
+		attention_gamma_table_momentum_gradient.add_(attention_gamma_table.grad, alpha=(1 - momentum_rate))
+		attention_gamma_table.sub_(attention_gamma_table_momentum_gradient * normalized_learning_rate)
+
+		ffn_gamma_table_momentum_gradient.mul_(momentum_rate)
+		ffn_gamma_table_momentum_gradient.add_(ffn_gamma_table.grad, alpha=(1 - momentum_rate))
+		ffn_gamma_table.sub_(ffn_gamma_table_momentum_gradient * normalized_learning_rate)
 
 		token_embedding_table.grad = None
 		positional_embedding_table.grad = None
@@ -563,14 +571,17 @@ def set_learning_rate(loss):
 torch._dynamo.config.compiled_autograd = True
 compiled_training_step = torch.compile(
 	training_step,
-	# max-autotune-no-cudagraphs for long uses. default mode for testing
+	# max-autotune for long uses. default mode for testing
 	mode="max-autotune",
+	# mode="default",
 	dynamic=False,
 )
 
 compiled_update_weights = torch.compile(
 	update_weights,
-	mode="max-autotune-no-cudagraphs",
+	# max-autotune-no-cudagraphs for long uses. default mode for testing
+	mode="max-autotune",
+	# mode="default",
 	dynamic=False
 )
 
@@ -715,6 +726,7 @@ set_learning_rate(current_least_loss)
 fp8_config = Float8LinearConfig.from_recipe_name("tensorwise")
 fp8_config = replace(
 	fp8_config,
+	force_recompute_fp8_weight_in_bwd=False,
 	gemm_config_grad_input=Float8GemmConfig(use_fast_accum=True),
 	gemm_config_grad_weight=Float8GemmConfig(use_fast_accum=True),
 )
@@ -722,44 +734,111 @@ convert_to_float8_training(qkv_linear, config=fp8_config)
 convert_to_float8_training(ffn_up_linear, config=fp8_config)
 convert_to_float8_training(ffn_down_linear, config=fp8_config)
 
-# profile_iterations = 200
+# Warm up the normal compiled training/optimizer graphs first.
+for _ in range(50):
+    torch.compiler.cudagraph_mark_step_begin()
 
-# forward_total = 0.0
-# backward_total = 0.0
-# optimizer_total = 0.0
+    start_positions = torch.randint(
+        high=number_of_training_windows,
+        size=(batch_size,),
+        dtype=torch.long,
+    )[:, None]
 
-# for _ in range(profile_iterations):
-# 	start_positions = torch.randint(high=number_of_training_windows, size=(batch_size,), dtype=torch.long)[:, None]
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        window_loss = compiled_training_step(
+            start_positions,
+            token_ids,
+        )
 
-# 	torch.cuda.synchronize()
-# 	start = time.perf_counter()
+    compiled_update_weights()
 
-# 	with torch.autocast("cuda", dtype=torch.bfloat16):
-# 		window_loss = run_forward_pass(start_positions, token_ids)
 
-# 	torch.cuda.synchronize()
-# 	forward_total += time.perf_counter() - start
+# Generate one fresh set of gradients that we can reuse for profiling.
+torch.compiler.cudagraph_mark_step_begin()
 
-# 	start = time.perf_counter()
+start_positions = torch.randint(
+    high=number_of_training_windows,
+    size=(batch_size,),
+    dtype=torch.long,
+)[:, None]
 
-# 	window_loss.backward()
+with torch.autocast("cuda", dtype=torch.bfloat16):
+    window_loss = compiled_training_step(
+        start_positions,
+        token_ids,
+    )
 
-# 	torch.cuda.synchronize()
-# 	backward_total += time.perf_counter() - start
 
-# 	start = time.perf_counter()
+# Save references to all of those gradients.
+saved_token_grad = token_embedding_table.grad
+saved_position_grad = positional_embedding_table.grad
+saved_output_grad = output_weight_table.grad
+saved_attention_gamma_grad = attention_gamma_table.grad
+saved_ffn_gamma_grad = ffn_gamma_table.grad
 
-# 	update_weights()
+saved_qkv_grads = [
+    qkv_linear[layer].weight.grad
+    for layer in range(number_of_layers)
+]
 
-# 	torch.cuda.synchronize()
-# 	optimizer_total += time.perf_counter() - start
+saved_ffn_up_grads = [
+    ffn_up_linear[layer].weight.grad
+    for layer in range(number_of_layers)
+]
 
-# print(f"Forward:   {forward_total / profile_iterations * 1000:.3f} ms")
-# print(f"Backward:  {backward_total / profile_iterations * 1000:.3f} ms")
-# print(f"Optimizer: {optimizer_total / profile_iterations * 1000:.3f} ms")
-# print(f"Total:     {(forward_total + backward_total + optimizer_total) / profile_iterations * 1000:.3f} ms")
+saved_ffn_down_grads = [
+    ffn_down_linear[layer].weight.grad
+    for layer in range(number_of_layers)
+]
 
-# sys.exit()
+
+def restore_grads():
+    token_embedding_table.grad = saved_token_grad
+    positional_embedding_table.grad = saved_position_grad
+    output_weight_table.grad = saved_output_grad
+    attention_gamma_table.grad = saved_attention_gamma_grad
+    ffn_gamma_table.grad = saved_ffn_gamma_grad
+
+    for layer in range(number_of_layers):
+        qkv_linear[layer].weight.grad = saved_qkv_grads[layer]
+        ffn_up_linear[layer].weight.grad = saved_ffn_up_grads[layer]
+        ffn_down_linear[layer].weight.grad = saved_ffn_down_grads[layer]
+
+
+torch.cuda.synchronize()
+
+
+with profile(
+    activities=[
+        ProfilerActivity.CPU,
+        ProfilerActivity.CUDA,
+    ],
+    record_shapes=False,
+    profile_memory=False,
+    with_stack=False,
+) as prof:
+
+    for _ in range(100):
+        # update_weights() sets all .grad fields to None,
+        # so put our saved gradients back before each call.
+        restore_grads()
+
+        compiled_update_weights()
+
+
+torch.cuda.synchronize()
+
+
+print(
+    prof.key_averages().table(
+        sort_by="self_cuda_time_total",
+        row_limit=50,
+    )
+)
+
+prof.export_chrome_trace("optimizer_profile.json")
+
+sys.exit()
 
 #! Training loop                 
 while True:
