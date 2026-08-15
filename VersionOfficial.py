@@ -1,7 +1,3 @@
-# VersionOfficial: Autograd implementation with linear FP8 multiplication.
-# Also includes momentum-gradient learning and checkpoint support for the
-# linear QKV and feed-forward layers.
-
 import subprocess
 import sys
 from torch.profiler import profile, ProfilerActivity
@@ -73,7 +69,7 @@ UNKNOWN_TOKEN = "<unk>"
 mask_value = -2e4
 device = torch.device("cuda")
 torch.manual_seed(12354)
-epsilon = 1e-5
+epsilon = 1e-7
 FP8_E4M3 = torch.float8_e4m3fn
 FP8_E5M2 = torch.float8_e5m2
 
@@ -168,7 +164,15 @@ def save_model(path, iteration, best_loss, previous_elapsed_seconds):
 		"ffn_hidden_size": ffn_hidden_size,
 		"persistent_learning_rate": persistent_learning_rate,
 		"head_count": head_count,
-		"norm_power": norm_power,
+		"pmax": pmax,
+		"qkv_initial_weight_rms": qkv_initial_weight_rms.detach().cpu(),
+		"qkv_reference_momentum_rms": qkv_reference_momentum_rms.detach().cpu(),
+		"ffn_up_initial_weight_rms": ffn_up_initial_weight_rms.detach().cpu(),
+		"ffn_up_reference_momentum_rms": ffn_up_reference_momentum_rms.detach().cpu(),
+		"ffn_down_initial_weight_rms": ffn_down_initial_weight_rms.detach().cpu(),
+		"ffn_down_reference_momentum_rms": ffn_down_reference_momentum_rms.detach().cpu(),
+		"Wo_initial_weight_rms": Wo_initial_weight_rms.detach().cpu(),
+		"Wo_reference_momentum_rms": Wo_reference_momentum_rms.detach().cpu(),
 
 		"token_embedding_table": token_embedding_table.detach().cpu(),
 		"positional_embedding_table": (
@@ -201,6 +205,7 @@ def save_model(path, iteration, best_loss, previous_elapsed_seconds):
 	for layer in range(number_of_layers):
 		checkpoint[f"ffn_up_linear_layer{layer+1}"] = ffn_up_linear[layer].weight.detach().cpu()
 		checkpoint[f"ffn_down_linear_layer{layer+1}"] = ffn_down_linear[layer].weight.detach().cpu()
+		checkpoint[f"Wo_linear{layer+1}"] = Wo_linear[layer].weight.detach().cpu()
 
 		checkpoint[f"ffn_up_linear_momentum_gradient_layer{layer+1}"] = (
 			ffn_up_linear_momentum_gradient[layer].detach().cpu()
@@ -208,6 +213,10 @@ def save_model(path, iteration, best_loss, previous_elapsed_seconds):
 
 		checkpoint[f"ffn_down_linear_momentum_gradient_layer{layer+1}"] = (
 			ffn_down_linear_momentum_gradient[layer].detach().cpu()
+		)
+
+		checkpoint[f"Wo_linear_momentum_gradient_layer{layer+1}"] = (
+			Wo_linear_momentum_gradient[layer].detach().cpu()
 		)
 
 		checkpoint[f"qkv_linear_weight_layer{layer+1}"] = qkv_linear[layer].weight.detach().cpu()
@@ -238,14 +247,20 @@ def load_model(path):
 	global ffn_down_linear
 	global attention_gamma_table
 	global ffn_gamma_table
+	global Wo_linear
 	global token_embedding_table_momentum_gradient
 	global positional_embedding_table_momentum_gradient
 	global qkv_linear_momentum_gradient
 	global output_weight_table_momentum_gradient
 	global ffn_up_linear_momentum_gradient
 	global ffn_down_linear_momentum_gradient
+	global Wo_linear_momentum_gradient
 	global attention_gamma_table_momentum_gradient
 	global ffn_gamma_table_momentum_gradient
+	global qkv_initial_weight_rms, qkv_reference_momentum_rms
+	global ffn_up_initial_weight_rms, ffn_up_reference_momentum_rms
+	global ffn_down_initial_weight_rms, ffn_down_reference_momentum_rms
+	global Wo_initial_weight_rms, Wo_reference_momentum_rms
 
 	path = Path(path)
 
@@ -299,13 +314,19 @@ def load_model(path):
 	if "momentum_rate" not in checkpoint:
 		raise ValueError("Cannot load checkpoint: momentum_rate doesn't exist.\n")
 
-	if "norm_power" not in checkpoint:
-		raise ValueError("Cannot load checkpoint: norm_power doesn't exist.\n")
+	if "pmax" not in checkpoint:
+		raise ValueError("Cannot load checkpoint: pmax doesn't exist.\n")
 
 	if "qkv_linear_momentum_gradient" not in checkpoint:
 		raise ValueError("Checkpoint does not contain momentum buffers.")
 
+	baseline_keys = ("qkv_initial_weight_rms", "qkv_reference_momentum_rms", "ffn_up_initial_weight_rms", "ffn_up_reference_momentum_rms", "ffn_down_initial_weight_rms", "ffn_down_reference_momentum_rms", "Wo_initial_weight_rms", "Wo_reference_momentum_rms")
+	missing_baselines = [key for key in baseline_keys if key not in checkpoint]
+	if missing_baselines:
+		raise ValueError(f"Checkpoint does not contain optimizer baseline data: {missing_baselines}")
+
 	expected_qkv_shape = (3 * embedding_size, embedding_size)
+	expected_wo_shape = (embedding_size, embedding_size)
 	for layer in range(number_of_layers):
 		qkv_key = f"qkv_linear_weight_layer{layer+1}"
 		if qkv_key not in checkpoint:
@@ -316,6 +337,17 @@ def load_model(path):
 				f"Layer: {layer + 1}\n"
 				f"Checkpoint: {checkpoint[qkv_key].shape}\n"
 				f"Current: {expected_qkv_shape}"
+			)
+
+		wo_key = f"Wo_linear{layer+1}"
+		if wo_key not in checkpoint:
+			raise ValueError(f"Checkpoint does not contain {wo_key}.")
+		if checkpoint[wo_key].shape != expected_wo_shape:
+			raise ValueError(
+				"Cannot load checkpoint: Wo weight shape differs.\n"
+				f"Layer: {layer + 1}\n"
+				f"Checkpoint: {checkpoint[wo_key].shape}\n"
+				f"Current: {expected_wo_shape}"
 			)
 
 	if checkpoint["ffn_hidden_size"] != ffn_hidden_size:
@@ -362,14 +394,22 @@ def load_model(path):
 		"attention_gamma_table_momentum_gradient"
 	].to(device)
 
-	ffn_gamma_table_momentum_gradient = checkpoint[
-		"ffn_gamma_table_momentum_gradient"
-	].to(device)
+	ffn_gamma_table_momentum_gradient = checkpoint["ffn_gamma_table_momentum_gradient"].to(device)
+	qkv_initial_weight_rms = checkpoint["qkv_initial_weight_rms"].to(device)
+	qkv_reference_momentum_rms = checkpoint["qkv_reference_momentum_rms"].to(device)
+	ffn_up_initial_weight_rms = checkpoint["ffn_up_initial_weight_rms"].to(device)
+	ffn_up_reference_momentum_rms = checkpoint["ffn_up_reference_momentum_rms"].to(device)
+	ffn_down_initial_weight_rms = checkpoint["ffn_down_initial_weight_rms"].to(device)
+	ffn_down_reference_momentum_rms = checkpoint["ffn_down_reference_momentum_rms"].to(device)
+	Wo_initial_weight_rms = checkpoint["Wo_initial_weight_rms"].to(device)
+	Wo_reference_momentum_rms = checkpoint["Wo_reference_momentum_rms"].to(device)
+
 	with torch.no_grad():
 		for layer in range(number_of_layers):
 			qkv_linear[layer].weight.copy_(checkpoint[f"qkv_linear_weight_layer{layer+1}"].to(device))
 			ffn_up_linear[layer].weight.copy_(checkpoint[f"ffn_up_linear_layer{layer+1}"].to(device))
 			ffn_down_linear[layer].weight.copy_(checkpoint[f"ffn_down_linear_layer{layer+1}"].to(device))
+			Wo_linear[layer].weight.copy_(checkpoint[f"Wo_linear{layer+1}"].to(device))
 
 			ffn_up_linear_momentum_gradient[layer] = checkpoint[
 				f"ffn_up_linear_momentum_gradient_layer{layer+1}"
@@ -378,6 +418,15 @@ def load_model(path):
 			ffn_down_linear_momentum_gradient[layer] = checkpoint[
 				f"ffn_down_linear_momentum_gradient_layer{layer+1}"
 			].to(device)
+
+			Wo_momentum_key = f"Wo_linear_momentum_gradient_layer{layer+1}"
+			if Wo_momentum_key in checkpoint:
+				Wo_linear_momentum_gradient[layer] = checkpoint[Wo_momentum_key].to(device)
+			else:
+				# Older checkpoints did not save Wo momentum buffers.
+				Wo_linear_momentum_gradient[layer] = torch.zeros_like(
+					Wo_linear[layer].weight
+				)
 
 	iteration = checkpoint.get("iteration", 0)
 	best_loss = checkpoint.get("best_loss", float("inf"))
@@ -411,7 +460,7 @@ def run_forward_attention(layer, input_embeddings, normalized_input_embeddings):
 		dropout_p=0, is_causal=True
 	).transpose(1, 2)
 	attention_output_matrix = attention_output_matrix.reshape(batch_size, CONTEXT_LENGTH, embedding_size)
-	attention_output_matrix = attention_output_matrix + input_embeddings
+	attention_output_matrix = Wo_linear[layer](attention_output_matrix) + input_embeddings
 
 	return attention_output_matrix
 
@@ -455,7 +504,7 @@ def run_forward_pass(start_positions, source_token_ids):
 
 		ffn_upscale_matrix = ffn_up_linear[layer](scaled_ffn_input)
 		
-		ffn_upscale_matrix = F.relu(ffn_upscale_matrix)
+		ffn_upscale_matrix = F.gelu(ffn_upscale_matrix, approximate="tanh")
 
 		layer_state = ffn_down_linear[layer](ffn_upscale_matrix) + attention_output_matrix
 
@@ -483,15 +532,36 @@ def update_weights():
 		positional_embedding_table_momentum_gradient.add_(positional_embedding_table.grad, alpha=(1 - momentum_rate))
 		positional_embedding_table.sub_(positional_embedding_table_momentum_gradient * normalized_learning_rate)
 
-		#& QKV layers
+		qkv_log_ratio = torch.zeros(number_of_layers, device=device)
+		qkv_momentum_rms = torch.zeros(number_of_layers, device=device)
+		qkv_log_average = 0
+
 		for layer in range(number_of_layers):
 			qkv_linear_momentum_gradient[layer].mul_(momentum_rate)
 			qkv_linear_momentum_gradient[layer].add_(qkv_linear[layer].weight.grad, alpha=(1 - momentum_rate))
+			qkv_momentum_rms[layer] = qkv_linear_momentum_gradient[layer].square().mean().sqrt()
+			qkv_linear_rms = qkv_linear[layer].weight.square().mean().sqrt()
+			qkv_log_ratio[layer] = (torch.log(qkv_linear_rms / (qkv_momentum_rms[layer] + epsilon)))
 
-			qkv_weight_rms = qkv_linear[layer].weight.square().mean().sqrt()
-			qkv_momentum_rms = qkv_linear_momentum_gradient[layer].square().mean().sqrt()
+		qkv_log_average = qkv_log_ratio.mean()
+		qkv_std = qkv_log_ratio.std()
+		qkv_zscore = (qkv_log_ratio - qkv_log_average) / (qkv_std + epsilon)
+		qkv_norm_power = pmax * (1 - 2 ** (-qkv_zscore.abs()))
+		qkv_ratio = torch.exp(qkv_log_ratio - qkv_log_average)
+		qkv_momentum_ratio = (qkv_reference_momentum_rms / (qkv_momentum_rms + epsilon)) ** global_norm_power
+
+		# Store QKV derived stats and multiplier for external debugging/printing
+		qkv_zscore_table.copy_(qkv_zscore)
+		qkv_norm_power_table.copy_(qkv_norm_power)
+		qkv_ratio_table.copy_(qkv_ratio)
+		qkv_momentum_multiplier.copy_(qkv_momentum_ratio)
+		qkv_multiplier.copy_(qkv_ratio ** qkv_norm_power * qkv_momentum_ratio)
+
+		#& QKV layers
+		for layer in range(number_of_layers):
 			qkv_linear[layer].weight.sub_(
-				(qkv_weight_rms / (qkv_momentum_rms + epsilon)) ** norm_power
+				qkv_ratio[layer] ** qkv_norm_power[layer]
+				* qkv_momentum_ratio[layer]
 				* qkv_linear_momentum_gradient[layer]
 				* normalized_learning_rate
 			)
@@ -502,26 +572,99 @@ def update_weights():
 		output_weight_table.sub_(output_weight_table_momentum_gradient * normalized_learning_rate)
 
 		#& FFN layers
+		# Use the same log/std based normalization strategy as QKV for FFN up/down
+		ffn_up_log_ratio = torch.zeros(number_of_layers, device=device)
+		ffn_down_log_ratio = torch.zeros(number_of_layers, device=device)
+		ffn_up_momentum_rms = torch.zeros(number_of_layers, device=device)
+		ffn_down_momentum_rms = torch.zeros(number_of_layers, device=device)
+
 		for layer in range(number_of_layers):
 			ffn_up_linear_momentum_gradient[layer].mul_(momentum_rate)
 			ffn_up_linear_momentum_gradient[layer].add_(ffn_up_linear[layer].weight.grad, alpha=(1 - momentum_rate))
+			ffn_up_momentum_rms[layer] = ffn_up_linear_momentum_gradient[layer].square().mean().sqrt()
 			ffn_up_linear_rms = ffn_up_linear[layer].weight.square().mean().sqrt()
-			ffn_up_momentum_rms = ffn_up_linear_momentum_gradient[layer].square().mean().sqrt()
+			ffn_up_log_ratio[layer] = torch.log(ffn_up_linear_rms / (ffn_up_momentum_rms[layer] + epsilon))
+
+			ffn_down_linear_momentum_gradient[layer].mul_(momentum_rate)
+			ffn_down_linear_momentum_gradient[layer].add_(ffn_down_linear[layer].weight.grad, alpha=(1 - momentum_rate))
+			ffn_down_momentum_rms[layer] = ffn_down_linear_momentum_gradient[layer].square().mean().sqrt()
+			ffn_down_linear_rms = ffn_down_linear[layer].weight.square().mean().sqrt()
+			ffn_down_log_ratio[layer] = torch.log(ffn_down_linear_rms / (ffn_down_momentum_rms[layer] + epsilon))
+
+		ffn_up_log_average = ffn_up_log_ratio.mean()
+		ffn_up_std = ffn_up_log_ratio.std()
+		ffn_up_zscore_local = (ffn_up_log_ratio - ffn_up_log_average) / (ffn_up_std + epsilon)
+		ffn_up_norm_power_local = pmax * (1 - 2 ** (-ffn_up_zscore_local.abs()))
+		ffn_up_ratio_local = torch.exp(ffn_up_log_ratio - ffn_up_log_average)
+		ffn_up_momentum_ratio = (ffn_up_reference_momentum_rms / (ffn_up_momentum_rms + epsilon)) ** global_norm_power
+
+		ffn_down_log_average = ffn_down_log_ratio.mean()
+		ffn_down_std = ffn_down_log_ratio.std()
+		ffn_down_zscore_local = (ffn_down_log_ratio - ffn_down_log_average) / (ffn_down_std + epsilon)
+		ffn_down_norm_power_local = pmax * (1 - 2 ** (-ffn_down_zscore_local.abs()))
+		ffn_down_ratio_local = torch.exp(ffn_down_log_ratio - ffn_down_log_average)
+		ffn_down_momentum_ratio = (ffn_down_reference_momentum_rms / (ffn_down_momentum_rms + epsilon)) ** global_norm_power
+
+		# Store FFN up/down stats and multipliers for debugging/printing (copy from local)
+		ffn_up_zscore.copy_(ffn_up_zscore_local)
+		ffn_up_norm_power.copy_(ffn_up_norm_power_local)
+		ffn_up_ratio.copy_(ffn_up_ratio_local)
+		ffn_up_momentum_multiplier.copy_(ffn_up_momentum_ratio)
+		ffn_up_multiplier.copy_(ffn_up_ratio_local ** ffn_up_norm_power_local * ffn_up_momentum_ratio)
+
+		ffn_down_zscore.copy_(ffn_down_zscore_local)
+		ffn_down_norm_power.copy_(ffn_down_norm_power_local)
+		ffn_down_ratio.copy_(ffn_down_ratio_local)
+		ffn_down_momentum_multiplier.copy_(ffn_down_momentum_ratio)
+		ffn_down_multiplier.copy_(ffn_down_ratio_local ** ffn_down_norm_power_local * ffn_down_momentum_ratio)
+
+		for layer in range(number_of_layers):
 			ffn_up_linear[layer].weight.sub_(
-				(ffn_up_linear_rms / (ffn_up_momentum_rms + epsilon)) ** norm_power
+				ffn_up_ratio_local[layer] ** ffn_up_norm_power_local[layer]
+				* ffn_up_momentum_ratio[layer]
 				* ffn_up_linear_momentum_gradient[layer]
 				* normalized_learning_rate
 			)
 
-			ffn_down_linear_momentum_gradient[layer].mul_(momentum_rate)
-			ffn_down_linear_momentum_gradient[layer].add_(ffn_down_linear[layer].weight.grad, alpha=(1 - momentum_rate))
-			ffn_down_linear_rms = ffn_down_linear[layer].weight.square().mean().sqrt()
-			ffn_down_momentum_rms = ffn_down_linear_momentum_gradient[layer].square().mean().sqrt()
 			ffn_down_linear[layer].weight.sub_(
-				(ffn_down_linear_rms / (ffn_down_momentum_rms + epsilon)) ** norm_power
+				ffn_down_ratio_local[layer] ** ffn_down_norm_power_local[layer]
+				* ffn_down_momentum_ratio[layer]
 				* ffn_down_linear_momentum_gradient[layer]
 				* normalized_learning_rate
 			)
+
+		#& Wo layers — apply log/std normalization like QKV
+		Wo_log_ratio = torch.zeros(number_of_layers, device=device)
+		Wo_momentum_rms = torch.zeros(number_of_layers, device=device)
+
+		for layer in range(number_of_layers):
+			Wo_linear_momentum_gradient[layer].mul_(momentum_rate)
+			Wo_linear_momentum_gradient[layer].add_(Wo_linear[layer].weight.grad, alpha=(1 - momentum_rate))
+			Wo_momentum_rms[layer] = Wo_linear_momentum_gradient[layer].square().mean().sqrt()
+			Wo_linear_rms = Wo_linear[layer].weight.square().mean().sqrt()
+			Wo_log_ratio[layer] = torch.log(Wo_linear_rms / (Wo_momentum_rms[layer] + epsilon))
+
+		Wo_log_average = Wo_log_ratio.mean()
+		Wo_std = Wo_log_ratio.std()
+		Wo_zscore_local = (Wo_log_ratio - Wo_log_average) / (Wo_std + epsilon)
+		Wo_norm_power_local = pmax * (1 - 2 ** (-Wo_zscore_local.abs()))
+		Wo_ratio_local = torch.exp(Wo_log_ratio - Wo_log_average)
+		Wo_momentum_ratio = (Wo_reference_momentum_rms / (Wo_momentum_rms + epsilon)) ** global_norm_power
+
+		for layer in range(number_of_layers):
+			Wo_linear[layer].weight.sub_(
+				Wo_ratio_local[layer] ** Wo_norm_power_local[layer]
+				* Wo_momentum_ratio[layer]
+				* Wo_linear_momentum_gradient[layer]
+				* normalized_learning_rate
+			)
+
+		# Store Wo stats and multipliers for debugging/printing (copy from local)
+		Wo_zscore.copy_(Wo_zscore_local)
+		Wo_norm_power.copy_(Wo_norm_power_local)
+		Wo_ratio.copy_(Wo_ratio_local)
+		Wo_momentum_multiplier.copy_(Wo_momentum_ratio)
+		Wo_multiplier.copy_(Wo_ratio_local ** Wo_norm_power_local * Wo_momentum_ratio)
 
 		#& Gamma tables
 		attention_gamma_table_momentum_gradient.mul_(momentum_rate)
@@ -536,6 +679,7 @@ def update_weights():
 		positional_embedding_table.grad = None
 		for layer in range(number_of_layers):
 			qkv_linear[layer].weight.grad = None
+			Wo_linear[layer].weight.grad = None
 		output_weight_table.grad = None
 		attention_gamma_table.grad = None
 		ffn_gamma_table.grad = None
@@ -569,10 +713,11 @@ def set_learning_rate(loss):
 	learning_rate_tensor.fill_(learning_rate)	
 
 torch._dynamo.config.compiled_autograd = True
+max_compile = False
 compiled_training_step = torch.compile(
 	training_step,
 	# max-autotune for long uses. default mode for testing
-	mode="max-autotune",
+	mode="max-autotune" if max_compile else "default",
 	# mode="default",
 	dynamic=False,
 )
@@ -580,23 +725,27 @@ compiled_training_step = torch.compile(
 compiled_update_weights = torch.compile(
 	update_weights,
 	# max-autotune-no-cudagraphs for long uses. default mode for testing
-	mode="max-autotune",
+	mode="max-autotune" if max_compile else "default",
 	# mode="default",
 	dynamic=False
 )
 
 
 #! Settings                                                 
-embedding_size = 768
-CONTEXT_LENGTH = 128
-batch_size = 32
+embedding_size = 512
+CONTEXT_LENGTH = 384
+batch_size = 24
 gradient_scale = 256
-head_count = 6
+head_count = 4
+ffn_hidden_multiplier = [4, 3, 3, 3, 3, 3, 3, 3]
 momentum_rate = 0.9
-norm_power = 0.5
+pmax = 0.85        # relative layer correction
+global_norm_power = 0.45      # whole-family magnitude correction
+rms_scale_max = 2.5
+calibration_steps = 100
+calibration_burn_in_steps = 50
 number_of_training_windows = len(token_ids) - CONTEXT_LENGTH
 load_persistent_learning = True
-ffn_hidden_multiplier = [4, 3, 3, 3, 3, 3, 3, 3]
 
 
 example_start_positions = torch.arange(CONTEXT_LENGTH, CONTEXT_LENGTH * (batch_size + 1), step=CONTEXT_LENGTH)[:, None]
@@ -644,6 +793,11 @@ if (1):
 		for layer in range(number_of_layers)
 	])
 
+	Wo_linear = nn.ModuleList([
+		nn.Linear(embedding_size, embedding_size, bias=False, device=device)
+		for _ in range(number_of_layers)
+	])
+
 	attention_gamma_table = nn.Parameter(torch.ones(number_of_layers, embedding_size, device=device))
 	ffn_gamma_table = nn.Parameter(torch.ones(number_of_layers, embedding_size, device=device))
 
@@ -662,6 +816,7 @@ if (1):
 
 	ffn_up_linear_momentum_gradient = [torch.zeros(ffn_hidden_size[i], embedding_size, device=device) for i in range(number_of_layers)]
 	ffn_down_linear_momentum_gradient = [torch.zeros(embedding_size, ffn_hidden_size[i], device=device) for i in range(number_of_layers)]	
+	Wo_linear_momentum_gradient = [torch.zeros(embedding_size, embedding_size, device=device) for _ in range(number_of_layers)]	
 
 	attention_gamma_table_momentum_gradient = torch.zeros(number_of_layers, embedding_size, device=device)
 	ffn_gamma_table_momentum_gradient = torch.zeros(number_of_layers, embedding_size, device=device)
@@ -673,16 +828,67 @@ if (1):
 	context_indices = torch.arange(CONTEXT_LENGTH, dtype=torch.long, device=device)[None, :]
 	context_indices_plus1 = torch.arange(CONTEXT_LENGTH + 1, dtype=torch.long)[None, :]
 	learning_rate_tensor = torch.tensor(learning_rate, device=device, dtype=torch.float32)
+	# Per-layer debug multipliers and stats (updated each weight update)
+	qkv_multiplier = torch.ones(number_of_layers, device=device)
+	qkv_zscore_table = torch.zeros(number_of_layers, device=device)
+	qkv_norm_power_table = torch.zeros(number_of_layers, device=device)
+	qkv_ratio_table = torch.ones(number_of_layers, device=device)
+    
+	# Per-layer momentum-only multipliers for debugging
+	qkv_momentum_multiplier = torch.ones(number_of_layers, device=device)
+
+	ffn_up_multiplier = torch.ones(number_of_layers, device=device)
+	ffn_up_zscore = torch.zeros(number_of_layers, device=device)
+	ffn_up_norm_power = torch.zeros(number_of_layers, device=device)
+	ffn_up_ratio = torch.ones(number_of_layers, device=device)
+
+	ffn_up_momentum_multiplier = torch.ones(number_of_layers, device=device)
+
+	ffn_down_multiplier = torch.ones(number_of_layers, device=device)
+	ffn_down_zscore = torch.zeros(number_of_layers, device=device)
+	ffn_down_norm_power = torch.zeros(number_of_layers, device=device)
+	ffn_down_ratio = torch.ones(number_of_layers, device=device)
+
+	ffn_down_momentum_multiplier = torch.ones(number_of_layers, device=device)
+
+	Wo_multiplier = torch.ones(number_of_layers, device=device)
+	Wo_zscore = torch.zeros(number_of_layers, device=device)
+	Wo_norm_power = torch.zeros(number_of_layers, device=device)
+	Wo_ratio = torch.ones(number_of_layers, device=device)
+
+	Wo_momentum_multiplier = torch.ones(number_of_layers, device=device)
+
+	# Fixed optimizer baselines. Fresh models fill these during calibration; checkpoints load them.
+	qkv_initial_weight_rms = torch.zeros(number_of_layers, device=device)
+	qkv_reference_momentum_rms = torch.zeros(number_of_layers, device=device)
+	ffn_up_initial_weight_rms = torch.zeros(number_of_layers, device=device)
+	ffn_up_reference_momentum_rms = torch.zeros(number_of_layers, device=device)
+	ffn_down_initial_weight_rms = torch.zeros(number_of_layers, device=device)
+	ffn_down_reference_momentum_rms = torch.zeros(number_of_layers, device=device)
+	Wo_initial_weight_rms = torch.zeros(number_of_layers, device=device)
+	Wo_reference_momentum_rms = torch.zeros(number_of_layers, device=device)
+
 
 iteration = 0
 loss_window_average = 0.0
 window_loss_size = 1000
 checkpoint_interval = 30000
+max_training_hours = 3
 learning_rate_patience = 20
 last_improvement_window = 0
 persistent_learning_rate = 1
 number_of_validation_batches = 32
-fixed_validation_positions = torch.randint(high = len(validation_token_ids) - CONTEXT_LENGTH, size = (number_of_validation_batches, batch_size, 1), dtype = torch.long)
+
+
+validation_generator = torch.Generator()
+validation_generator.manual_seed(20260813)
+
+fixed_validation_positions = torch.randint(
+    high=len(validation_token_ids) - CONTEXT_LENGTH,
+    size=(number_of_validation_batches, batch_size, 1),
+    dtype=torch.long,
+    generator=validation_generator,
+)
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
 checkpoint_path = CHECKPOINT_DIR / f"{CONTEXT_LENGTH}x{embedding_size}_{number_of_layers}lr_atNorm_{head_count}hd_mon_rms.pt"
@@ -700,6 +906,7 @@ else:
 	current_least_loss = float("inf")
 	previous_elapsed_seconds = 0
 	persistent_learning_rate = 1
+
 
 # iteration = 0
 # current_least_loss = float("inf")
@@ -730,115 +937,69 @@ fp8_config = replace(
 	gemm_config_grad_input=Float8GemmConfig(use_fast_accum=True),
 	gemm_config_grad_weight=Float8GemmConfig(use_fast_accum=True),
 )
+
 convert_to_float8_training(qkv_linear, config=fp8_config)
 convert_to_float8_training(ffn_up_linear, config=fp8_config)
 convert_to_float8_training(ffn_down_linear, config=fp8_config)
+convert_to_float8_training(Wo_linear, config=fp8_config)
 
-# Warm up the normal compiled training/optimizer graphs first.
-for _ in range(50):
-    torch.compiler.cudagraph_mark_step_begin()
+#& Fresh-model optimizer calibration
+if not checkpoint_loaded:
+	print(f"Calibrating optimizer baseline for {calibration_steps} steps...")
+	calibration_generator = torch.Generator().manual_seed(20260815)
 
-    start_positions = torch.randint(
-        high=number_of_training_windows,
-        size=(batch_size,),
-        dtype=torch.long,
-    )[:, None]
+	with torch.no_grad():
+		qkv_initial_weight_rms.copy_(torch.stack([m.weight.square().mean().sqrt() for m in qkv_linear]))
+		ffn_up_initial_weight_rms.copy_(torch.stack([m.weight.square().mean().sqrt() for m in ffn_up_linear]))
+		ffn_down_initial_weight_rms.copy_(torch.stack([m.weight.square().mean().sqrt() for m in ffn_down_linear]))
+		Wo_initial_weight_rms.copy_(torch.stack([m.weight.square().mean().sqrt() for m in Wo_linear]))
 
-    with torch.autocast("cuda", dtype=torch.bfloat16):
-        window_loss = compiled_training_step(
-            start_positions,
-            token_ids,
-        )
+	measurements = 0
+	for calibration_step in range(calibration_steps):
+		torch.compiler.cudagraph_mark_step_begin()
+		start_positions = torch.randint(number_of_training_windows, (batch_size,), generator=calibration_generator, dtype=torch.long)[:, None]
+		with torch.autocast("cuda", dtype=torch.bfloat16):
+			compiled_training_step(start_positions, token_ids)
 
-    compiled_update_weights()
+		with torch.no_grad():
+			token_embedding_table_momentum_gradient.mul_(momentum_rate).add_(token_embedding_table.grad, alpha=1 - momentum_rate)
+			positional_embedding_table_momentum_gradient.mul_(momentum_rate).add_(positional_embedding_table.grad, alpha=1 - momentum_rate)
+			output_weight_table_momentum_gradient.mul_(momentum_rate).add_(output_weight_table.grad, alpha=1 - momentum_rate)
+			attention_gamma_table_momentum_gradient.mul_(momentum_rate).add_(attention_gamma_table.grad, alpha=1 - momentum_rate)
+			ffn_gamma_table_momentum_gradient.mul_(momentum_rate).add_(ffn_gamma_table.grad, alpha=1 - momentum_rate)
 
+			for layer in range(number_of_layers):
+				qkv_linear_momentum_gradient[layer].mul_(momentum_rate).add_(qkv_linear[layer].weight.grad, alpha=1 - momentum_rate)
+				ffn_up_linear_momentum_gradient[layer].mul_(momentum_rate).add_(ffn_up_linear[layer].weight.grad, alpha=1 - momentum_rate)
+				ffn_down_linear_momentum_gradient[layer].mul_(momentum_rate).add_(ffn_down_linear[layer].weight.grad, alpha=1 - momentum_rate)
+				Wo_linear_momentum_gradient[layer].mul_(momentum_rate).add_(Wo_linear[layer].weight.grad, alpha=1 - momentum_rate)
 
-# Generate one fresh set of gradients that we can reuse for profiling.
-torch.compiler.cudagraph_mark_step_begin()
+			if calibration_step >= calibration_burn_in_steps:
+				qkv_reference_momentum_rms.add_(qkv_linear_momentum_gradient.square().mean(dim=(1, 2)).sqrt())
+				ffn_up_reference_momentum_rms.add_(torch.stack([m.square().mean().sqrt() for m in ffn_up_linear_momentum_gradient]))
+				ffn_down_reference_momentum_rms.add_(torch.stack([m.square().mean().sqrt() for m in ffn_down_linear_momentum_gradient]))
+				Wo_reference_momentum_rms.add_(torch.stack([m.square().mean().sqrt() for m in Wo_linear_momentum_gradient]))
+				measurements += 1
 
-start_positions = torch.randint(
-    high=number_of_training_windows,
-    size=(batch_size,),
-    dtype=torch.long,
-)[:, None]
+			token_embedding_table.grad = positional_embedding_table.grad = output_weight_table.grad = None
+			attention_gamma_table.grad = ffn_gamma_table.grad = None
+			for layer in range(number_of_layers):
+				qkv_linear[layer].weight.grad = ffn_up_linear[layer].weight.grad = None
+				ffn_down_linear[layer].weight.grad = Wo_linear[layer].weight.grad = None
 
-with torch.autocast("cuda", dtype=torch.bfloat16):
-    window_loss = compiled_training_step(
-        start_positions,
-        token_ids,
-    )
+	qkv_reference_momentum_rms.div_(measurements)
+	ffn_up_reference_momentum_rms.div_(measurements)
+	ffn_down_reference_momentum_rms.div_(measurements)
+	Wo_reference_momentum_rms.div_(measurements)
 
+	# Save immediately so the fixed baseline survives restarts before the first validation checkpoint.
+	save_model(checkpoint_path, iteration=0, best_loss=float("inf"), previous_elapsed_seconds=0)
+	print("Optimizer baseline calibrated and saved.")
 
-# Save references to all of those gradients.
-saved_token_grad = token_embedding_table.grad
-saved_position_grad = positional_embedding_table.grad
-saved_output_grad = output_weight_table.grad
-saved_attention_gamma_grad = attention_gamma_table.grad
-saved_ffn_gamma_grad = ffn_gamma_table.grad
+# Do not count calibration/compile time as training time.
+window_start_time = time.perf_counter()
+current_start_time = time.perf_counter()
 
-saved_qkv_grads = [
-    qkv_linear[layer].weight.grad
-    for layer in range(number_of_layers)
-]
-
-saved_ffn_up_grads = [
-    ffn_up_linear[layer].weight.grad
-    for layer in range(number_of_layers)
-]
-
-saved_ffn_down_grads = [
-    ffn_down_linear[layer].weight.grad
-    for layer in range(number_of_layers)
-]
-
-
-def restore_grads():
-    token_embedding_table.grad = saved_token_grad
-    positional_embedding_table.grad = saved_position_grad
-    output_weight_table.grad = saved_output_grad
-    attention_gamma_table.grad = saved_attention_gamma_grad
-    ffn_gamma_table.grad = saved_ffn_gamma_grad
-
-    for layer in range(number_of_layers):
-        qkv_linear[layer].weight.grad = saved_qkv_grads[layer]
-        ffn_up_linear[layer].weight.grad = saved_ffn_up_grads[layer]
-        ffn_down_linear[layer].weight.grad = saved_ffn_down_grads[layer]
-
-
-torch.cuda.synchronize()
-
-
-with profile(
-    activities=[
-        ProfilerActivity.CPU,
-        ProfilerActivity.CUDA,
-    ],
-    record_shapes=False,
-    profile_memory=False,
-    with_stack=False,
-) as prof:
-
-    for _ in range(100):
-        # update_weights() sets all .grad fields to None,
-        # so put our saved gradients back before each call.
-        restore_grads()
-
-        compiled_update_weights()
-
-
-torch.cuda.synchronize()
-
-
-print(
-    prof.key_averages().table(
-        sort_by="self_cuda_time_total",
-        row_limit=50,
-    )
-)
-
-prof.export_chrome_trace("optimizer_profile.json")
-
-sys.exit()
 
 #! Training loop                 
 while True:
@@ -852,6 +1013,68 @@ while True:
 		window_loss = compiled_training_step(start_positions, token_ids)
 
 	compiled_update_weights()
+
+	if iteration % (window_loss_size * 7) == 0:
+		with torch.no_grad():
+			print("\n--- Multipliers ---")
+			for layer in range(number_of_layers):
+				# QKV
+				z = qkv_zscore_table[layer].item()
+				p = qkv_norm_power_table[layer].item()
+				ratio = qkv_ratio_table[layer].item()
+				mult = qkv_multiplier[layer].item()
+				mom = qkv_momentum_multiplier[layer].item()
+				p_str = f"{p:.3f}".lstrip("0")
+				print(f"QKV L{layer} | z={z:+.2f} | p={p_str} | ratio={ratio:.2f} | multiplier={mult:.3f} | mom={mom:.3f}")
+
+			# FFN up/down
+			for layer in range(number_of_layers):
+				z = ffn_up_zscore[layer].item()
+				p = ffn_up_norm_power[layer].item()
+				ratio = ffn_up_ratio[layer].item()
+				mult = ffn_up_multiplier[layer].item()
+				mom = ffn_up_momentum_multiplier[layer].item()
+				p_str = f"{p:.3f}".lstrip("0")
+				print(f"UP  L{layer} | z={z:+.2f} | p={p_str} | ratio={ratio:.2f} | multiplier={mult:.3f} | mom={mom:.3f}")
+
+			for layer in range(number_of_layers):
+				z = ffn_down_zscore[layer].item()
+				p = ffn_down_norm_power[layer].item()
+				ratio = ffn_down_ratio[layer].item()
+				mult = ffn_down_multiplier[layer].item()
+				mom = ffn_down_momentum_multiplier[layer].item()
+				p_str = f"{p:.3f}".lstrip("0")
+				print(f"DOWN L{layer} | z={z:+.2f} | p={p_str} | ratio={ratio:.2f} | multiplier={mult:.3f} | mom={mom:.3f}")
+
+			# Wo
+			for layer in range(number_of_layers):
+				z = Wo_zscore[layer].item()
+				p = Wo_norm_power[layer].item()
+				ratio = Wo_ratio[layer].item()
+				mult = Wo_multiplier[layer].item()
+				mom = Wo_momentum_multiplier[layer].item()
+				p_str = f"{p:.3f}".lstrip("0")
+				print(f"Wo  L{layer} | z={z:+.2f} | p={p_str} | ratio={ratio:.2f} | multiplier={mult:.3f} | mom={mom:.3f}")
+
+	if max_training_hours is not None:
+		current_session_elapsed_seconds = time.perf_counter() - current_start_time
+		if current_session_elapsed_seconds >= max_training_hours * 3600:
+			total_elapsed_seconds = (
+				previous_elapsed_seconds + current_session_elapsed_seconds
+			)
+			print(
+				f"Training time limit reached: "
+				f"{current_session_elapsed_seconds / 3600:.2f} hours "
+				"in this session."
+			)
+			save_model(
+				checkpoint_path,
+				iteration=iteration,
+				best_loss=current_least_loss,
+				previous_elapsed_seconds=total_elapsed_seconds,
+			)
+			print("Final checkpoint saved. Training stopped.")
+			raise SystemExit(0)
 
 	loss_window_average += window_loss.detach()
 
@@ -947,4 +1170,3 @@ while True:
 
 		loss_window_average = 0.0
 		window_start_time = time.perf_counter()
-

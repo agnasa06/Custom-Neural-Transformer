@@ -54,8 +54,8 @@ def encode_text(text):
 def decode_token_ids(token_ids):
 	return "".join([id_to_character[token_id] if token_id != character_to_id[UNKNOWN_TOKEN] else UNKNOWN_TOKEN for token_id in token_ids])
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-CHECKPOINT_DIR = BASE_DIR / "Saved_bests"
+BASE_DIR = Path(__file__).resolve().parent
+CHECKPOINT_DIR = BASE_DIR / "checkpoints"
 
 def load_model(path):
 	"""
@@ -68,6 +68,7 @@ def load_model(path):
 	global token_embedding_table
 	global positional_embedding_table
 	global qkv_weight_table
+	global Wo_weight_table
 	global output_weight_table
 	global ffn_up_weight_table
 	global ffn_down_weight_table
@@ -123,23 +124,30 @@ def load_model(path):
 			f"Current: {head_count}"
 		)
 
-	expected_qkv_shape = (number_of_layers, 3 * embedding_size,embedding_size,)
+	expected_qkv_shape = (3 * embedding_size, embedding_size)
+	expected_wo_shape = (embedding_size, embedding_size)
+	for layer in range(number_of_layers):
+		qkv_key = f"qkv_linear_weight_layer{layer + 1}"
+		if qkv_key not in checkpoint:
+			raise ValueError(f"Checkpoint does not contain {qkv_key}.")
+		if checkpoint[qkv_key].shape != expected_qkv_shape:
+			raise ValueError(
+				"Cannot load checkpoint: QKV weight shape differs.\n"
+				f"Layer: {layer + 1}\n"
+				f"Checkpoint: {checkpoint[qkv_key].shape}\n"
+				f"Current: {expected_qkv_shape}"
+			)
 
-	checkpoint_qkv_shape = (
-		checkpoint["qkv_weight_table"].shape if "qkv_weight_table" in checkpoint
-		else (
-			checkpoint["query_weight_table"].shape[0],
-			3 * checkpoint["query_weight_table"].shape[1],
-			checkpoint["query_weight_table"].shape[2],
-		)
-	)
-
-	if checkpoint_qkv_shape != expected_qkv_shape:
-		raise ValueError(
-			"Cannot load checkpoint: QKV weight shape differs.\n"
-			f"Checkpoint: {checkpoint_qkv_shape}\n"
-			f"Current: {expected_qkv_shape}"
-		)
+		wo_key = f"Wo_linear{layer + 1}"
+		if wo_key not in checkpoint:
+			raise ValueError(f"Checkpoint does not contain {wo_key}.")
+		if checkpoint[wo_key].shape != expected_wo_shape:
+			raise ValueError(
+				"Cannot load checkpoint: Wo weight shape differs.\n"
+				f"Layer: {layer + 1}\n"
+				f"Checkpoint: {checkpoint[wo_key].shape}\n"
+				f"Current: {expected_wo_shape}"
+			)
 
 	if checkpoint["ffn_hidden_size"] != ffn_hidden_size:
 		raise ValueError(
@@ -154,20 +162,6 @@ def load_model(path):
 	if "ffn_gamma_table" in checkpoint:
 		ffn_gamma_table = checkpoint["ffn_gamma_table"].to(device)
 
-	if "qkv_weight_table" in checkpoint:
-		qkv_weight_table = checkpoint[
-			"qkv_weight_table"
-		].to(device)
-
-	else:
-		qkv_weight_table = torch.cat(
-			[
-				checkpoint["query_weight_table"],
-				checkpoint["key_weight_table"],
-				checkpoint["value_weight_table"],
-			],
-			dim=1,
-		).to(device)
 	token_embedding_table = checkpoint[
 		"token_embedding_table"
 	].to(device)
@@ -181,10 +175,10 @@ def load_model(path):
 	].to(device)
 
 	for layer in range(number_of_layers):
-		ffn_up_weight_table[layer] = checkpoint[f"ffn_up_weight_table_layer{layer+1}"].to(device)
-		ffn_down_weight_table[layer] = checkpoint[f"ffn_down_weight_table_layer{layer+1}"].to(device)
-
-	refresh_fp16_matrices()
+		qkv_weight_table[layer] = checkpoint[f"qkv_linear_weight_layer{layer+1}"].to(device)
+		ffn_up_weight_table[layer] = checkpoint[f"ffn_up_linear_layer{layer+1}"].transpose(-2, -1).to(device)
+		ffn_down_weight_table[layer] = checkpoint[f"ffn_down_linear_layer{layer+1}"].transpose(-2, -1).to(device)
+		Wo_weight_table[layer] = checkpoint[f"Wo_linear{layer+1}"].to(device)
 
 	iteration = checkpoint.get("iteration", 0)
 	best_loss = checkpoint.get("best_loss", float("inf"))
@@ -201,28 +195,9 @@ def get_input_token_ids(start_positions, source_token_ids, L):
 	offsets = torch.arange(L, device=device, dtype=torch.long)[None, :]
 	return source_token_ids[start_positions + offsets]
 
-def refresh_fp16_matrices():
-	global fp16_token_embedding_table
-	global fp16_positional_embedding_table
-	global fp16_qkv_weight_table
-	global fp16_output_weight_table
-	global fp16_ffn_up_weight_table
-	global fp16_ffn_down_weight_table
-	global fp16_attention_gamma_table
-	global fp16_ffn_gamma_table
-	fp16_token_embedding_table.copy_(token_embedding_table)
-	fp16_positional_embedding_table.copy_(positional_embedding_table)
-	fp16_qkv_weight_table.copy_(qkv_weight_table)
-	fp16_output_weight_table.copy_(output_weight_table)
-	fp16_attention_gamma_table.copy_(attention_gamma_table)
-	fp16_ffn_gamma_table.copy_(ffn_gamma_table)
-	for layer in range(number_of_layers):
-		fp16_ffn_up_weight_table[layer].copy_(ffn_up_weight_table[layer])
-		fp16_ffn_down_weight_table[layer].copy_(ffn_down_weight_table[layer])
-
 def run_forward_attention(layer, input_embeddings, normalized_input_embeddings, causal_mask, L):
 	#% Shape: 3 x context_length x embedding_size
-	qkv_matrix = (normalized_input_embeddings @ fp16_qkv_weight_table[layer].transpose(-2, -1))
+	qkv_matrix = (normalized_input_embeddings @ qkv_weight_table[layer].transpose(-2, -1))
 
 	query_matrix = qkv_matrix[...,0:embedding_size,]
 	key_matrix = qkv_matrix[...,embedding_size:2 * embedding_size,]
@@ -235,11 +210,12 @@ def run_forward_attention(layer, input_embeddings, normalized_input_embeddings, 
 	#% Shape: context_length x context_length
 	attention_score_matrix = query_matrix @ key_matrix.transpose(-2, -1) / math.sqrt(embedding_size // head_count)
 	attention_score_matrix = attention_score_matrix.masked_fill(causal_mask, mask_value)
-	attention_weight_matrix = torch.softmax(attention_score_matrix.float(), dim=-1).to(torch.float16)
+	attention_weight_matrix = torch.softmax(attention_score_matrix.float(), dim=-1)
 
 	#% Shape: context_length x embedding_size
 	attention_output_matrix = (attention_weight_matrix @ value_matrix).transpose(1, 2)
 	attention_output_matrix = attention_output_matrix.reshape(batch_size, L, embedding_size)
+	attention_output_matrix = attention_output_matrix @ Wo_weight_table[layer].transpose(-2, -1)
 	attention_output_matrix += input_embeddings
 
 	# 0: query_matrix, 1: key_matrix, 2: value_matrix
@@ -253,13 +229,13 @@ def run_forward_pass(start_positions, source_token_ids, L):
 	input_token_ids = get_input_token_ids(start_positions, source_token_ids, L)
 	
 	causal_mask = future_mask[:L, :L]
-	pos_embeds = positional_embedding_table[:L, :].to(torch.float16)
+	pos_embeds = positional_embedding_table[:L, :]
 
 	# print(input_token_ids.shape)
 
 	#% Shape: context_length × embedding_size
 	#* This is converting each token (character) in the input of size CONTEXT_LENGTH (64) to their vector representation from the token_embedding_table
-	input_token_embeddings = fp16_token_embedding_table[input_token_ids]
+	input_token_embeddings = token_embedding_table[input_token_ids]
 
 	#% Shape: context_length x embedding_size
 	#* Retrieves the position vector for each position in this input window. For now, this matches the full positional_embedding_table and is mainly useful for debugging.
@@ -291,33 +267,33 @@ def run_forward_pass(start_positions, source_token_ids, L):
 		layer_state_input = layer_state[layer].float()
 		root_mean_square = torch.sqrt(layer_state_input.square().mean(dim = -1, keepdim = True) + epsilon)
 		attention_inverse_root_mean_square[layer] = 1 / root_mean_square
-		normalized_layer_state[layer] = (layer_state_input * attention_inverse_root_mean_square[layer]).to(torch.float16)
-		scaled_layer_state[layer] = normalized_layer_state[layer] * fp16_attention_gamma_table[layer]
+		normalized_layer_state[layer] = layer_state_input * attention_inverse_root_mean_square[layer]
+		scaled_layer_state[layer] = normalized_layer_state[layer] * attention_gamma_table[layer]
 		(query_matrix[layer], key_matrix[layer], value_matrix[layer], 
 		attention_weight_matrix[layer], attention_output_matrix[layer]) = run_forward_attention(layer, layer_state[layer], scaled_layer_state[layer], causal_mask, L)
 
 		ffn_input = attention_output_matrix[layer].float()
 		root_mean_square = torch.sqrt(ffn_input.square().mean(dim = -1, keepdim = True) + epsilon)
 		ffn_inverse_root_mean_square[layer] = 1 / root_mean_square
-		normalized_ffn_input[layer] = (ffn_input * ffn_inverse_root_mean_square[layer]).to(torch.float16)
-		scaled_ffn_input[layer] = normalized_ffn_input[layer] * fp16_ffn_gamma_table[layer]
+		normalized_ffn_input[layer] = ffn_input * ffn_inverse_root_mean_square[layer]
+		scaled_ffn_input[layer] = normalized_ffn_input[layer] * ffn_gamma_table[layer]
 
-		ffn_upscale_matrix[layer] = scaled_ffn_input[layer] @ fp16_ffn_up_weight_table[layer]
+		ffn_upscale_matrix[layer] = scaled_ffn_input[layer] @ ffn_up_weight_table[layer]
 		
-		ffn_upscale_matrix[layer].relu_()
+		ffn_upscale_matrix[layer] = F.gelu(ffn_upscale_matrix[layer], approximate="tanh")
 
-		layer_state[layer + 1] = ffn_upscale_matrix[layer] @ fp16_ffn_down_weight_table[layer] + attention_output_matrix[layer]
+		layer_state[layer + 1] = ffn_upscale_matrix[layer] @ ffn_down_weight_table[layer] + attention_output_matrix[layer]
 
 	#% Shape: context_length x number_of_ids
 	#* Dot products attention context vectors with each vocab character's output weights,
 	#* so if logits_matrix[10][20] is high, it means the attenuated output vector at position 10 supports the usage of character_id 20, so 'u' in this case
-	logits_matrix = layer_state[number_of_layers] @ fp16_output_weight_table.transpose(-2, -1)
+	logits_matrix = layer_state[number_of_layers] @ output_weight_table.transpose(-2, -1)
 
 	#% Shape: context_length x number_of_ids
 	#* Softmaxes logits_matrix row by row, so each position gets softmaxed where the character ids are turned into probabilities
 	log_probability_matrix = F.log_softmax(logits_matrix.float(),dim=-1,)
 
-	probability_matrix = (log_probability_matrix.exp().to(torch.float16))
+	probability_matrix = log_probability_matrix.exp()
 
 	# average_loss = -log_probability_matrix[batch_indices,context_indices,target_token_ids,].mean()
 
@@ -381,7 +357,7 @@ def print_top_probabilities(position, probability_matrix, top_k=10):
 
 #! Settings                                                 
 embedding_size = 512
-CONTEXT_LENGTH = 128
+CONTEXT_LENGTH = 384
 batch_size = 1
 gradient_scale = 256
 head_count = 4
@@ -409,6 +385,9 @@ if (1):
 
 	#% Shape: 3 x embedding_size x embedding_size
 	qkv_weight_table = torch.rand(number_of_layers, 3 * embedding_size, embedding_size,) * (2 * scale) - scale
+
+	#% Shape: embedding_size x embedding_size
+	Wo_weight_table = [torch.rand(embedding_size, embedding_size, device=device) * (2 * scale) - scale for _ in range(number_of_layers)]
 
 	#% Shape: number_of_ids x embedding_size
 	#* Determines/asks how much an attention_output vector supports a character being next
@@ -438,19 +417,9 @@ if (1):
 	context_indices = torch.arange(CONTEXT_LENGTH, dtype=torch.long, device=device)[None, :]
 	context_indices_plus1 = torch.arange(CONTEXT_LENGTH + 1, dtype=torch.long)[None, :]
 
-	fp16_token_embedding_table = token_embedding_table.to(torch.float16)
-	fp16_positional_embedding_table = positional_embedding_table.to(torch.float16)
-	fp16_qkv_weight_table = qkv_weight_table.to(torch.float16)
-	fp16_output_weight_table = output_weight_table.to(torch.float16)
-	fp16_ffn_up_weight_table = [ffn_up_weight_table[i].to(torch.float16) for i in range(number_of_layers)]
-	fp16_ffn_down_weight_table = [ffn_down_weight_table[i].to(torch.float16) for i in range(number_of_layers)]
-	fp16_attention_gamma_table = attention_gamma_table.to(torch.float16)
-	fp16_ffn_gamma_table = ffn_gamma_table.to(torch.float16)
-
-
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
-checkpoint_path = CHECKPOINT_DIR / "128x512_8lr_atNorm_4hd_mon_rms.pt"
+checkpoint_path = CHECKPOINT_DIR / "384x512_8lr_atNorm_4hd_mon_rms.pt"
 
 if checkpoint_path.exists() and checkpoint_path.stat().st_size > 0:
 	iteration, current_least_loss, persistent_learning_rate, previous_elapsed_seconds = load_model(checkpoint_path)
@@ -476,7 +445,8 @@ for iteration in range(1000):
 
 	start_position = torch.tensor([max(len(token_ids) - CONTEXT_LENGTH, 0)], device=device)[None, :]
 	L = min(len(token_ids), CONTEXT_LENGTH)
-	forward_pass_results = run_forward_pass(start_position, torch.tensor(token_ids, device=device), L)
+	with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+		forward_pass_results = run_forward_pass(start_position, torch.tensor(token_ids, device=device), L)
 
 	predicted_id = get_predicted_id_for_position(L - 1, forward_pass_results[12], top_k)
 	token_ids.append(predicted_id)
