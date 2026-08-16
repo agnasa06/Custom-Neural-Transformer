@@ -1,11 +1,35 @@
-# VersionOfficial local update summary
+# VersionOfficial change log
 
-This local version of VersionOfficial.py differs from the repo copy in the optimizer and checkpoint logic for the QKV path. The goal was to make the query/key/value split explicit and keep the optimizer state compatible with the downstream code path that expects separate Q/K/V behavior.
+This document consolidates the main local changes made to `VersionOfficial.py` and keeps each set of updates associated with its own commit area.
 
-## Key changes
+## Commit 1: TorchAO / runtime optimization and profiling updates
 
-### 1) Split the QKV optimizer state into query, key, and value paths
-- Replaced the old single aggregated QKV momentum bookkeeping with separate query/key/value tracking.
+This change set updates the training runtime and vendorized TorchAO path.
+
+### `VersionOfficial.py`
+- Uses `torch.nn.functional.scaled_dot_product_attention` with causal attention instead of manually constructing attention score, mask, softmax, and value product logic.
+- Computes the language-model loss with `F.cross_entropy` over flattened logits and targets.
+- Groups momentum-gradient calculation alongside the corresponding parameter update so the QKV and FFN layer updates are applied in the same loop.
+- Uses `normalized_learning_rate` consistently for embedding, output, gamma, QKV, and FFN updates.
+- Enables TorchInductor CUDAGraph support for input mutation through `torch._inductor.config.triton.cudagraph_support_input_mutation`.
+- Compiles the training and update functions with `torch.compile(..., mode="max-autotune")`.
+- Configures TorchAO FP8 training to avoid recomputing FP8 weights during backward and enables fast accumulation for gradient-input and gradient-weight GEMMs.
+- Adds a 50-iteration warmup before profiling.
+- Adds an optimizer profiling phase that reuses one generated gradient set, profiles 100 compiled optimizer updates, and exports `optimizer_profile.json`.
+
+### Vendored TorchAO `float8_linear.py`
+Compared with the corresponding backup from the installed TorchAO environment:
+- The forward pass stores the already-converted FP8 input and weight tensors in the autograd context along with the high-precision tensors.
+- The backward pass reuses those saved FP8 tensors for the input-gradient and weight-gradient matrix multiplications.
+- Backward no longer recasts the weight, gradient output, and input tensors to FP8 for those calculations.
+- This reduces repeated FP8 conversion work and aligns with the `force_recompute_fp8_weight_in_bwd=False` configuration used by `VersionOfficial.py`.
+
+## Commit 2: QKV optimizer split and checkpoint compatibility
+
+This change set refactors the optimizer logic so the query, key, and value paths are tracked independently while preserving compatibility with the downstream QKV code path.
+
+### Split Q/K/V optimizer state
+- Replaced the previous single aggregate QKV momentum bookkeeping with separate query, key, and value tracking.
 - Added separate reference momentum RMS buffers:
   - `query_reference_momentum_rms`
   - `key_reference_momentum_rms`
@@ -17,16 +41,13 @@ This local version of VersionOfficial.py differs from the repo copy in the optim
   - `query_ratio_table`, `key_ratio_table`, `value_ratio_table`
   - `query_momentum_multiplier`, `key_momentum_multiplier`, `value_momentum_multiplier`
 
-### 2) Reworked the update logic to compute Q/K/V separately instead of as one fused QKV block
-- The optimizer update path now slices the QKV projection into:
-  - query block
-  - key block
-  - value block
-- Each block computes its own momentum gradient, row RMS, log-ratio, z-score, norm-power, ratio, and momentum-ratio values.
-- This makes the optimizer behavior align with the next code path that uses Q/K/V independently rather than a single aggregate QKV object.
+### Independent update logic for Q/K/V
+- The optimizer update path now slices the QKV projection into query, key, and value sections.
+- Each branch computes its own momentum gradient, row RMS, log-ratio, z-score, norm-power, ratio, and momentum-ratio values.
+- This aligns the optimizer behavior with the next code path that consumes Q/K/V independently instead of as a single fused QKV object.
 
-### 3) Added row-wise Q/K/V statistics and norm-power calculations
-- Added per-row values such as:
+### Row-wise statistics and layer scaling
+- Added per-row statistics such as:
   - `query_row_norm_power`
   - `key_row_norm_power`
   - `value_row_norm_power`
@@ -36,25 +57,14 @@ This local version of VersionOfficial.py differs from the repo copy in the optim
   - `query_row_history_ratio`
   - `key_row_history_ratio`
   - `value_row_history_ratio`
-- The optimizer now calculates row-wise log-ratio, z-score, and norm-power for each of Q/K/V separately.
+- Switched the stored layer-level scaling metadata to `pmax_layer` and updated the checkpoint validation to match.
 
-### 4) Switched the layer-level scaling variable to `pmax_layer`
-- The checkpoint metadata now stores `pmax_layer` instead of the old `pmax` field.
-- The loader validates for `pmax_layer` and loads the matching reference state.
-- This aligns the saved state with the current per-layer adaptive update logic.
+### RMS fix
+- Removed epsilon before the `.sqrt()` call in the RMS calculations so the adaptive statistics remain on the intended scale.
 
-### 5) Removed epsilon before `.sqrt()` in the RMS computations
-- The RMS calculations were adjusted to avoid applying epsilon before the square root.
-- This keeps the adaptive statistics in the intended scale and matches the user-requested optimizer behavior.
-
-### 6) Updated checkpoint compatibility and save/load logic
-- Save logic writes the new Q/K/V reference momentum fields.
-- Load logic restores those separate buffers and validates the checkpoint baseline keys.
-- This preserves compatibility with the refreshed optimizer state format without changing unrelated parts of the training pipeline.
-
-### 7) Kept the combined QKV-compatible variables only where needed for compatibility
-- The local version still keeps the QKV aggregate-style debug tables in place for compatibility with downstream code.
-- However, the actual optimization state and calculations are now split and applied independently per query, key, and value block.
+### Checkpoint compatibility
+- Updated save/load logic to write and restore the new Q/K/V reference momentum state.
+- Kept the merged QKV-compatible debug tables only where needed for downstream compatibility while the actual optimization math remains split by Q/K/V.
 
 ## Summary
-This local version is a targeted optimizer refactor for the attention projection path: the model still behaves as a QKV projection overall, but the update math and tracking state are now separated by query, key, and value so the later code path can consume the correct per-branch statistics without breaking compatibility.
+The repo now contains both the broader runtime optimization work and the narrower QKV optimizer refactor, but they are organized here under separate commit sections so the scope of each change is clear.
